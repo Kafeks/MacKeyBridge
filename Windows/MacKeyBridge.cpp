@@ -109,24 +109,29 @@ void write(Level lvl, const char* fmt, ...)
 // ==========================================================================
 // Protocol.h
 // ==========================================================================
-// Wire protocol between the macOS client and the Windows server (version 1).
-// Mirrored by constants at the top of mac-client/Sources/MacKeyBridgeClient/main.swift.
+// Wire protocol between the macOS client and the Windows server (version 2).
+// Mirrored by constants at the top of the macOS client (main.swift).
 //
 // Handshake (once per TCP connection):
 //   server -> client : [0x01 CHALLENGE][16 random bytes]
 //   client -> server : [0x02 AUTH][version][32 bytes HMAC-SHA256(secret, nonce)]
 //   server -> client : [0x03 AUTH_OK]   or   [0x04 AUTH_FAIL][reason]  (then close)
+//                      reason: 1 = wrong secret, 2 = protocol version mismatch
 //
-// Events (client -> server), fixed 4 bytes, little endian:
-//   [type][flags][code lo][code hi]
-//   type : 0x10 KEY_DOWN, 0x11 KEY_UP, 0x12 ALL_UP (release everything), 0x13 PING
-//   flags: bit0 = auto-repeat
-//   code : macOS virtual key code (0..0xFF), or 0x100 + NX_KEYTYPE_* for media keys
-//
-// Fn is just macOS key code 63; the server decides what it means.
+// Events (client -> server). The first byte is the type and determines the length:
+//   0x10 KEY_DOWN     [type][flags][code lo][code hi]            4 bytes (flags bit0 = auto-repeat)
+//   0x11 KEY_UP       [type][flags][code lo][code hi]            4 bytes
+//   0x12 ALL_UP       [type][0][0][0]                            4 bytes: release keys AND mouse buttons
+//   0x13 PING         [type][0][0][0]                            4 bytes
+//   0x20 MOUSE_MOVE   [type][dx lo][dx hi][dy lo][dy hi]         5 bytes, int16 LE, relative, pixels
+//   0x21 MOUSE_BUTTON [type][button][down 0/1]                   3 bytes, button: 0 left, 1 right, 2 middle,
+//                                                                          3 back (X1), 4 forward (X2)
+//   0x22 MOUSE_WHEEL  [type][dx lo][dx hi][dy lo][dy hi]         5 bytes, int16 LE, 120 = one notch,
+//                                                                          dy > 0 = up, dx > 0 = right
+// key code: macOS virtual key code (0..0xFF), or 0x100 + NX_KEYTYPE_* for media keys. Fn is code 63.
 
 namespace proto {
-constexpr uint8_t  kVersion     = 1;
+constexpr uint8_t  kVersion     = 2;
 constexpr uint16_t kDefaultPort = 47800;
 constexpr size_t   kNonceLen    = 16;
 constexpr size_t   kMacLen      = 32;
@@ -141,8 +146,26 @@ constexpr uint8_t kKeyUp   = 0x11;
 constexpr uint8_t kAllUp   = 0x12;
 constexpr uint8_t kPing    = 0x13;
 
-constexpr uint8_t kFlagRepeat = 0x01;
-constexpr size_t  kEventSize  = 4;
+constexpr uint8_t kMouseMove   = 0x20;
+constexpr uint8_t kMouseButton = 0x21;
+constexpr uint8_t kMouseWheel  = 0x22;
+
+constexpr uint8_t kFlagRepeat   = 0x01;
+constexpr size_t  kMaxEventSize = 5;
+
+// Total length in bytes (including the type byte) of an event, or 0 for an unknown type.
+inline size_t eventLength(uint8_t type) {
+    switch (type) {
+        case kKeyDown:
+        case kKeyUp:
+        case kAllUp:
+        case kPing:        return 4;
+        case kMouseMove:
+        case kMouseWheel:  return 5;
+        case kMouseButton: return 3;
+        default:           return 0;
+    }
+}
 }  // namespace proto
 
 
@@ -267,8 +290,13 @@ public:
     // Atomically: lift all held modifiers, press `mods` (+ optional key tap), restore the modifiers.
     void chord(uint8_t mods, const WinKey* key);
 
-    // Release everything we are holding (disconnect / panic). Masks the Win key so the Start menu
-    // does not pop up.
+    // Mouse / trackpad (relative movement, buttons 0..4 = left,right,middle,back,forward, wheel in 1/120 notch).
+    void mouseMove(int dx, int dy);
+    void mouseButton(int button, bool down);
+    void mouseWheel(int dx, int dy);
+
+    // Release everything we are holding (disconnect / panic): keys and mouse buttons. Masks the Win key
+    // so the Start menu does not pop up.
     void releaseAll();
 
 private:
@@ -279,11 +307,14 @@ private:
     static uint32_t id(const WinKey& k) { return (uint32_t(k.vk) << 8) | (k.ext ? 1u : 0u); }
     static INPUT make(const WinKey& k, bool down);
     static INPUT maskKey(bool down);
+    static INPUT makeMouse(DWORD flags, LONG dx, LONG dy, DWORD data);
+    static bool buttonInput(int button, bool down, INPUT& out);
     static bool isModifierVk(uint8_t vk);
     static bool isWinVk(uint8_t vk) { return vk == VK_LWIN || vk == VK_RWIN; }
     void send(std::vector<INPUT>& v);
 
     std::map<uint32_t, Held> held_;
+    bool mouseDown_[5] = {false, false, false, false, false};
     bool dry_ = false;
 };
 
@@ -371,6 +402,7 @@ struct TraceEvent {
     bool down = false;
     bool repeat = false;
     std::string physical;  // "Fn", "Left Command", ...
+    std::string detected;  // optional override for the "Detected key" line (mouse events)
     std::string mapped;    // "Language Switch (ENG -> RUS)", "Ctrl+C  (Cmd+C)", ...
     int scan = -1;         // Windows scan code actually injected, -1 = none
     int vk = -1;
@@ -385,6 +417,11 @@ public:
     void onKey(uint16_t macCode, bool down, bool repeat);
     void onAllUp();  // client said so, or the connection dropped: release everything
 
+    // Mouse / trackpad events (relative move in pixels, button 0..4, wheel in 1/120 notch).
+    void onMouseMove(int dx, int dy);
+    void onMouseButton(int button, bool down);
+    void onMouseWheel(int dx, int dy);
+
     // Keyboard Test mode: translate + trace, but do not inject and do not switch the layout.
     void setDryRun(bool on);
     void setTraceSink(std::function<void(const TraceEvent&)> f);
@@ -394,6 +431,7 @@ private:
     WinKey modifierTarget(uint16_t code, const Config& cfg) const;
     void runAction(const ShortcutAction& a, const ShortcutContext& ctx);
     void doToggle(TraceEvent& t);
+    void emitTrace(const TraceEvent& t);
     void releaseHeld(uint16_t code);
     bool isHeld(uint16_t code) const { return held_.count(code) != 0; }
 
@@ -921,6 +959,28 @@ INPUT Injector::maskKey(bool down) {
     return in;
 }
 
+INPUT Injector::makeMouse(DWORD flags, LONG dx, LONG dy, DWORD data) {
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dx = dx;
+    in.mi.dy = dy;
+    in.mi.mouseData = data;
+    in.mi.dwFlags = flags;
+    in.mi.dwExtraInfo = kTag;
+    return in;
+}
+
+bool Injector::buttonInput(int button, bool down, INPUT& out) {
+    switch (button) {
+        case 0: out = makeMouse(down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0); return true;
+        case 1: out = makeMouse(down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0, 0, 0); return true;
+        case 2: out = makeMouse(down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP, 0, 0, 0); return true;
+        case 3: out = makeMouse(down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP, 0, 0, XBUTTON1); return true;
+        case 4: out = makeMouse(down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP, 0, 0, XBUTTON2); return true;
+        default: return false;
+    }
+}
+
 bool Injector::isModifierVk(uint8_t vk) {
     return vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_LMENU ||
            vk == VK_RMENU || vk == VK_LWIN || vk == VK_RWIN;
@@ -999,6 +1059,28 @@ void Injector::chord(uint8_t mods, const WinKey* key) {
     send(v);
 }
 
+void Injector::mouseMove(int dx, int dy) {
+    if (dx == 0 && dy == 0) return;
+    std::vector<INPUT> v{makeMouse(MOUSEEVENTF_MOVE, dx, dy, 0)};
+    send(v);
+}
+
+void Injector::mouseButton(int button, bool down) {
+    INPUT in;
+    if (button < 0 || button > 4 || !buttonInput(button, down, in)) return;
+    if (mouseDown_[button] == down) return;  // ignore duplicate down/up
+    mouseDown_[button] = down;
+    std::vector<INPUT> v{in};
+    send(v);
+}
+
+void Injector::mouseWheel(int dx, int dy) {
+    std::vector<INPUT> v;
+    if (dy != 0) v.push_back(makeMouse(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(LONG)dy));
+    if (dx != 0) v.push_back(makeMouse(MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)(LONG)dx));
+    send(v);
+}
+
 void Injector::releaseAll() {
     std::vector<INPUT> v;
     bool winHeld = false;
@@ -1010,6 +1092,11 @@ void Injector::releaseAll() {
     }
     for (const auto& kv : held_) v.push_back(make(kv.second.key, false));
     held_.clear();
+    for (int b = 0; b < 5; ++b) {  // never leave a mouse button stuck down
+        INPUT in;
+        if (mouseDown_[b] && buttonInput(b, false, in)) v.push_back(in);
+        mouseDown_[b] = false;
+    }
     send(v);
 }
 
@@ -1252,6 +1339,50 @@ void KeyboardManager::onAllUp() {
     held_.clear();
     inj_.releaseAll();
     fnHeld_ = fnUsed_ = fnToggled_ = false;
+}
+
+void KeyboardManager::emitTrace(const TraceEvent& t) {
+    std::function<void(const TraceEvent&)> sink;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sink = trace_;
+    }
+    if (sink) sink(t);
+}
+
+void KeyboardManager::onMouseMove(int dx, int dy) {
+    if (dx < -5000 || dx > 5000 || dy < -5000 || dy > 5000) return;  // sanity limit
+    std::lock_guard<std::mutex> lk(mu_);
+    inj_.mouseMove(dx, dy);
+}
+
+void KeyboardManager::onMouseButton(int button, bool down) {
+    static const char* names[] = {"Left", "Right", "Middle", "Back", "Forward"};
+    if (button < 0 || button > 4) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        inj_.mouseButton(button, down);
+    }
+    LOG_DEBUG("Mouse %s button %s", names[button], down ? "DOWN" : "UP");
+    TraceEvent t;
+    t.down = down;
+    t.physical = std::string("Mouse ") + names[button] + " button";
+    t.detected = std::string("Trackpad / mouse button ") + (down ? "DOWN" : "UP");
+    t.mapped = std::string(names[button]) + " mouse button " + (down ? "down" : "up");
+    emitTrace(t);
+}
+
+void KeyboardManager::onMouseWheel(int dx, int dy) {
+    if (dx == 0 && dy == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        inj_.mouseWheel(dx, dy);
+    }
+    TraceEvent t;
+    t.physical = "Scroll (two-finger / wheel)";
+    t.detected = "dx=" + std::to_string(dx) + "  dy=" + std::to_string(dy);
+    t.mapped = dy != 0 ? (dy > 0 ? "Wheel up" : "Wheel down") : (dx > 0 ? "Wheel right" : "Wheel left");
+    emitTrace(t);
 }
 
 void KeyboardManager::onKey(uint16_t code, bool down, bool repeat) {
@@ -1654,21 +1785,43 @@ void NetworkServer::serve(SOCKET s, const std::string& peer) {
     LOG_INFO("Connected to MacBook (%s)", peer.c_str());
     notify();
 
-    uint8_t ev[proto::kEventSize];
-    while (!stop_) {
-        if (!recvAll(s, ev, (int)sizeof ev)) break;
-        const uint16_t code = (uint16_t)(ev[2] | (ev[3] << 8));
+    uint8_t ev[proto::kMaxEventSize];
+    bool bad = false;
+    while (!stop_ && !bad) {
+        if (!recvAll(s, ev, 1)) break;
+        const size_t len = proto::eventLength(ev[0]);
+        if (len == 0) {
+            LOG_WARN("Unknown packet type 0x%02X from %s, dropping connection", ev[0], peer.c_str());
+            break;
+        }
+        if (len > 1 && !recvAll(s, ev + 1, (int)len - 1)) break;
+
         switch (ev[0]) {
-            case proto::kKeyDown: kb_.onKey(code, true, (ev[1] & proto::kFlagRepeat) != 0); break;
-            case proto::kKeyUp:   kb_.onKey(code, false, false); break;
-            case proto::kAllUp:   kb_.onAllUp(); break;
-            case proto::kPing:    break;
+            case proto::kKeyDown:
+                kb_.onKey((uint16_t)(ev[2] | (ev[3] << 8)), true, (ev[1] & proto::kFlagRepeat) != 0);
+                break;
+            case proto::kKeyUp:
+                kb_.onKey((uint16_t)(ev[2] | (ev[3] << 8)), false, false);
+                break;
+            case proto::kAllUp:
+                kb_.onAllUp();
+                break;
+            case proto::kPing:
+                break;
+            case proto::kMouseMove:
+                kb_.onMouseMove((int16_t)(ev[1] | (ev[2] << 8)), (int16_t)(ev[3] | (ev[4] << 8)));
+                break;
+            case proto::kMouseButton:
+                kb_.onMouseButton(ev[1], ev[2] != 0);
+                break;
+            case proto::kMouseWheel:
+                kb_.onMouseWheel((int16_t)(ev[1] | (ev[2] << 8)), (int16_t)(ev[3] | (ev[4] << 8)));
+                break;
             default:
-                LOG_WARN("Unknown packet type 0x%02X from %s, dropping connection", ev[0], peer.c_str());
-                goto done;
+                bad = true;
+                break;
         }
     }
-done:
     kb_.onAllUp();  // never leave keys stuck after a disconnect
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -2271,7 +2424,7 @@ void showTrace(const TraceEvent& t) {
     SetDlgItemTextW(S.test, IDC_PHYS, widen(t.physical).c_str());
     snprintf(b, sizeof b, "Mac keycode %u (0x%02X)  %s%s", (unsigned)t.macCode, (unsigned)t.macCode,
              t.down ? "DOWN" : "UP", t.repeat ? " (repeat)" : "");
-    SetDlgItemTextW(S.test, IDC_DET, widen(b).c_str());
+    SetDlgItemTextW(S.test, IDC_DET, widen(t.detected.empty() ? std::string(b) : t.detected).c_str());
     if (t.scan >= 0) snprintf(b, sizeof b, "0x%02X%s", (unsigned)t.scan, t.ext ? "  (E0 extended)" : "");
     else snprintf(b, sizeof b, "-");
     SetDlgItemTextW(S.test, IDC_SCAN, widen(b).c_str());

@@ -1,23 +1,25 @@
 # MacKeyBridge
 
-Use a MacBook's **built-in keyboard** to type on a **Windows PC** over Wi-Fi/LAN. The **Fn** key switches the Windows keyboard layout (e.g. English <-> Russian), and Mac shortcuts such as `Cmd+C` become `Ctrl+C`.
+Use a MacBook's **built-in keyboard and trackpad** to control a **Windows PC** over Wi-Fi/LAN. The **Fn** key switches the Windows keyboard layout (e.g. English <-> Russian), and Mac shortcuts such as `Cmd+C` become `Ctrl+C`.
 
 Two small programs, one file each:
 
 | Part | File | Language |
 |---|---|---|
 | Windows server (tray app) | [`windows/MacKeyBridge.cpp`](windows/MacKeyBridge.cpp) | C++20, Win32 API only |
-| macOS client | [`mac/main.swift`](mac/main.swift) | Swift |
+| macOS client (window + menu bar item) | [`mac/main.swift`](mac/main.swift) (+ optional [`mac/build-app.sh`](mac/build-app.sh)) | Swift, AppKit |
 
 ```
 MacBook keyboard --> macOS client --(TCP, Wi-Fi/LAN)--> MacKeyBridge.exe --> SendInput --> any Windows app
 ```
 
-> **Status:** works on the author's MacBook + Windows PC. It is a hobby project and not widely tested; issues and pull requests are welcome.
+> **Status:** keyboard forwarding and the Fn layout switch work on the author's MacBook + Windows PC. Trackpad forwarding and the Mac window (protocol 2) are new and may need tuning (pointer/scroll speed and direction). It is a hobby project and not widely tested; issues and pull requests are welcome.
 
 ## Features
 
-- Persistent TCP connection, 4 bytes per key event, auto-reconnect.
+- Persistent TCP connection, a few bytes per event, auto-reconnect.
+- **Trackpad / mouse:** pointer movement, tap and click (left, right, middle), drag, two-finger scroll (vertical + horizontal), with pointer speed, scroll speed and scroll-direction settings.
+- **Mac client with a GUI:** connect/disconnect, status, start/stop forwarding, sliders and checkboxes for the trackpad, permission status with shortcuts to the right System Settings panes, log, remembers its settings.
 - Keys are injected by scan code, so the active Windows layout decides the character (works in browsers, VS Code, Discord, terminals, most games).
 - **Fn tap = switch layout.** Layouts cycle in the order configured in the settings (ENG -> RUS -> ENG, more can be added).
 - **Mac Mode:** Left Command acts as Ctrl, Right Command acts as the Windows key, plus Mac-style shortcuts and text navigation.
@@ -60,20 +62,31 @@ netsh advfirewall firewall add rule name="MacKeyBridge" dir=in action=allow prot
 
 ```bash
 cd mac
-swiftc -O main.swift -o mackeybridge-client
-./mackeybridge-client --host <PC-IP> --port 47800 --secret <secret from the Windows settings>
+swiftc -O main.swift -o MacKeyBridge && ./MacKeyBridge
 ```
 
-`<PC-IP>` is the PC's address in your **home network** (`ipconfig` -> IPv4 address, e.g. `192.168.x.x`). Do not use a VPN address.
+A window opens. Enter the PC's **address** (its IPv4 address in your home network, `ipconfig` on the PC, e.g. `192.168.x.x` - not a VPN address), the **port** (47800) and the **secret** from the Windows settings, then click **Connect**. The settings are remembered.
 
-Grant permissions in **System Settings -> Privacy & Security** to your terminal app: **Accessibility**, **Input Monitoring** and **Local Network**; then restart the client.
+Run from the Terminal like this, macOS attaches the privacy permissions to the Terminal app. For a standalone app with its own permissions build the bundle instead:
+
+```bash
+cd mac
+chmod +x build-app.sh
+./build-app.sh        # creates and opens MacKeyBridge.app
+```
+
+Permissions (the window shows their status and has buttons that open the right panes of **System Settings -> Privacy & Security**): **Accessibility**, **Input Monitoring** and **Local Network**. Grant them to the app (or to your terminal when you use the quick command). After rebuilding the app macOS may ask again.
 
 Also set **System Settings -> Keyboard -> "Press Globe key to" = Do Nothing**, so macOS does not react to Fn.
 
+Optional command line (prefills the window and connects at once): `./MacKeyBridge --host <PC-IP> --port 47800 --secret <secret>`.
+
 ### 3. Use it
 
-- `Control + Option + Command + W` (or the menu bar item) toggles forwarding: the keyboard types on Windows (`⌨ → PC`) or back on the Mac.
+- `Control + Option + Command + W` (or the button in the window / the menu bar item) toggles forwarding: the keyboard **and trackpad** control Windows (`⌨ → PC`) or are back on the Mac.
+- While forwarding is on, the Mac cursor stays still and clicks do nothing on the Mac. **The hotkey is the way back**, it always works.
 - Tap **Fn** to switch the Windows layout.
+- Trackpad: move = pointer, tap or click = left click, two-finger click/tap = right click, two-finger swipe = scroll. Tap-to-click must be enabled in the Mac's trackpad settings if you want taps.
 
 ## Key mapping (Mac Mode, default)
 
@@ -94,7 +107,18 @@ Also set **System Settings -> Keyboard -> "Press Globe key to" = Do Nothing**, s
 | `Option+Left/Right/Backspace` | `Ctrl+Left` / `Ctrl+Right` / `Ctrl+Backspace` |
 | Volume, Play/Pause, Next/Previous | Windows media keys |
 
-Every group can be turned off in **Settings -> Keyboard**. With Mac Mode off, Command is simply the Windows key.
+## Trackpad settings (in the Mac window)
+
+| Setting | Meaning |
+|---|---|
+| Forward trackpad / mouse too | Off = only the keyboard is forwarded, the trackpad keeps controlling the Mac |
+| Pointer speed | Multiplier for pointer movement (Windows applies its own acceleration on top; disable *Enhance pointer precision* in Windows mouse settings if the pointer feels odd) |
+| Scroll speed | Multiplier for scrolling |
+| Invert vertical / horizontal scroll | Flip the direction if scrolling feels backwards on Windows |
+
+Swipes with three or four fingers (Mission Control, desktops) are handled by macOS itself and are not forwarded.
+
+Every keyboard group can be turned off in **Settings -> Keyboard** on Windows. With Mac Mode off, Command is simply the Windows key.
 
 ### Fn
 
@@ -126,12 +150,15 @@ Add language IDs (for example `0x0443` Uzbek Latin, `0x0407` German) to cycle th
 
 | Problem | Fix |
 |---|---|
-| Client prints `Waiting for Windows server` | Check the IP/port, that MacKeyBridge is running (tray icon not grey), and test with `nc -vz <PC-IP> 47800` on the Mac. |
+| The Mac window shows a red status (`Timed out`, `Connection refused`, `No route to host`) | The message says what failed. Check the IP/port, that MacKeyBridge is running (tray icon not grey), and test with `nc -vz <PC-IP> 47800` on the Mac. |
 | `nc` says `timed out` / `No route to host` | Add the firewall rule above (or set the Windows network to Private); allow **Local Network** for your terminal in macOS; make sure both devices are on the same subnet and the Wi-Fi has no client isolation. |
 | IP starts with `26.` or `25.` | That is a VPN address (Radmin VPN / Hamachi). Use the `192.168.x.x` / `10.x.x.x` address of your home network. |
-| `Authentication failed` | Wrong secret. Copy the command from the Windows settings window. |
-| `Cannot create the keyboard event tap` | Grant Accessibility and Input Monitoring to the terminal and restart the client. |
-| Keys type on both computers | Forwarding is off. The menu bar should show `⌨ → PC`. |
+| `Wrong secret` | Copy the secret from the Windows settings window. |
+| `Version mismatch` | Update both `MacKeyBridge.cpp` (rebuild the exe) and `main.swift`: they must be the same version (protocol 2). |
+| Window says permissions are missing / forwarding button is disabled | Grant Accessibility and Input Monitoring (the window has buttons for it). It activates by itself; if not, restart the app. |
+| Windows pointer moves too fast/slow or scroll is backwards | Adjust *Pointer speed*, *Scroll speed* and the invert checkboxes in the Mac window. |
+| Mac cursor stays frozen after a crash | Press `Control+Option+Command+W`, or quit and reopen MacKeyBridge. |
+| Keys type on both computers | Forwarding is off. The window button should say *Stop forwarding* and the menu bar `⌨ → PC`. |
 | Fn does nothing | Open tray -> **Keyboard Test**, enable forwarding, press Fn: you should see `Physical key: Fn`. Tap it briefly and without other keys. |
 | Wrong keys next to Left Shift / top-left | Enable "ISO keyboard" in the settings. |
 | Layout switch ignored in one app | Settings -> Languages -> switch method: try `Win+Space`. |
@@ -150,17 +177,22 @@ Log file: `%APPDATA%\MacKeyBridge\log.txt` (enable *Debug mode* to log every key
 - Windows apps running as administrator ignore input from a normal process (UIPI). Run MacKeyBridge as administrator if you need that.
 - The lock screen, UAC prompts and `Ctrl+Alt+Del` cannot be controlled through `SendInput`.
 - macOS blocks event taps while *Secure Input* is active (password fields in some apps).
-- Mac keyboards only; media keys other than volume/play/next/previous stay on the Mac.
+- Mac keyboards/trackpads only; media keys other than volume/play/next/previous (brightness, keyboard backlight) stay on the Mac.
+- Trackpad gestures with three or more fingers and pinch/rotate are not forwarded.
+- The Mac client stores its settings, including the secret, in the app's preferences (`UserDefaults`) in plain text.
 
-## Protocol (version 1)
+## Protocol (version 2)
 
-After the TCP connection the server sends a 16-byte challenge; the client answers with `HMAC-SHA256(secret, nonce)` and the protocol version. Then the client sends fixed 4-byte events:
+After the TCP connection the server sends a 16-byte challenge; the client answers with `HMAC-SHA256(secret, nonce)` and the protocol version; the server replies `AUTH_OK` or `AUTH_FAIL` + reason (1 wrong secret, 2 version mismatch). Then the client sends events; the first byte is the type and fixes the length:
 
 ```
-[type][flags][code lo][code hi]
-type : 0x10 KEY_DOWN, 0x11 KEY_UP, 0x12 ALL_UP, 0x13 PING
-flags: bit 0 = auto-repeat
-code : macOS virtual key code, or 0x100 + NX_KEYTYPE for media keys (Fn = 63)
+0x10 KEY_DOWN     [type][flags][code lo][code hi]       4 bytes (flags bit 0 = auto-repeat)
+0x11 KEY_UP       [type][flags][code lo][code hi]       4 bytes
+0x12 ALL_UP       [type][0][0][0]                       4 bytes - release keys and mouse buttons
+0x13 PING         [type][0][0][0]                       4 bytes
+0x20 MOUSE_MOVE   [type][dx int16][dy int16]            5 bytes, relative pixels
+0x21 MOUSE_BUTTON [type][button][down]                  3 bytes, 0 left 1 right 2 middle 3 back 4 forward
+0x22 MOUSE_WHEEL  [type][dx int16][dy int16]            5 bytes, 120 = one notch, dy>0 up, dx>0 right
 ```
 
-The client sends a ping every second; the server releases all keys if nothing arrives for 3 seconds.
+Key code: macOS virtual key code, or `0x100 + NX_KEYTYPE` for media keys (Fn = 63). The client pings every second; the server releases all keys and mouse buttons if nothing arrives for 3 seconds.
