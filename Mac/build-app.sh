@@ -20,8 +20,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>local.mackeybridge.client</string>
     <key>CFBundleExecutable</key><string>MacKeyBridge</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.0</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleShortVersionString</key><string>2.1</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -31,7 +31,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc signature: gives the app a stable identity for the macOS privacy permissions.
+# Ad-hoc signature: gives the app an identity for the macOS privacy permissions. Every rebuild changes it, so after
+# rebuilding re-grant Accessibility / Input Monitoring (see README, "Permissions"), or run:
+#   tccutil reset Accessibility local.mackeybridge.client; tccutil reset ListenEvent local.mackeybridge.client
 codesign --force --sign - "$APP"
 
 echo "Built $APP"
