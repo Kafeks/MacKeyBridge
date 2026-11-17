@@ -72,6 +72,40 @@ final class Prefs {
         get { d.bool(forKey: "autoConnect") }
         set { d.set(newValue, forKey: "autoConnect") }
     }
+<<<<<<< HEAD
+=======
+    var swipeNav: Bool {
+        get { (d.object(forKey: "swipeNav") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "swipeNav") }
+    }
+    var swipeThreshold: Double {
+        get { let v = d.double(forKey: "swipeThreshold"); return v == 0 ? 80.0 : v }
+        set { d.set(newValue, forKey: "swipeThreshold") }
+    }
+    var swipeKeys: Int {  // 0 = Left / Right arrow, 1 = Page Up / Page Down, 2 = mouse side buttons (Back / Forward)
+        get { d.integer(forKey: "swipeKeys") }
+        set { d.set(newValue, forKey: "swipeKeys") }
+    }
+    var swipeReverse: Bool {
+        get { d.bool(forKey: "swipeReverse") }
+        set { d.set(newValue, forKey: "swipeReverse") }
+    }
+    /// Emergency hotkey. Falls back to Control+Option+Command+W if the stored value is missing or unsafe.
+    var hotkey: Hotkey {
+        get {
+            var h = Hotkey()
+            if let c = d.object(forKey: "hotkeyCode") as? Int { h.code = UInt16(truncatingIfNeeded: c) }
+            if let f = d.object(forKey: "hotkeyFlags") as? Int { h.flags = UInt64(truncatingIfNeeded: f) }
+            if let n = d.string(forKey: "hotkeyName"), !n.isEmpty { h.name = n }
+            return h.isValid ? h : Hotkey()
+        }
+        set {
+            d.set(Int(newValue.code), forKey: "hotkeyCode")
+            d.set(Int(truncatingIfNeeded: newValue.flags), forKey: "hotkeyFlags")
+            d.set(newValue.name, forKey: "hotkeyName")
+        }
+    }
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 }
 
 let prefs = Prefs()
@@ -418,7 +452,276 @@ final class Link {
     }
 }
 
+<<<<<<< HEAD
 // MARK: - Event tap (keyboard, trackpad / mouse, media keys)
+=======
+// MARK: - Emergency hotkey
+
+let ctrlFlag = CGEventFlags.maskControl.rawValue
+let optFlag = CGEventFlags.maskAlternate.rawValue
+let cmdFlag = CGEventFlags.maskCommand.rawValue
+let shiftFlag = CGEventFlags.maskShift.rawValue
+let hotkeyModMask: UInt64 = ctrlFlag | optFlag | cmdFlag | shiftFlag
+
+/// Names for keys whose character is not printable (used when the user records a new hotkey).
+let specialKeyNames: [UInt16: String] = [
+    122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8",
+    101: "F9", 109: "F10", 103: "F11", 111: "F12",
+    49: "Space", 36: "Return", 48: "Tab", 51: "Delete",
+    123: "←", 124: "→", 125: "↓", 126: "↑", 116: "PgUp", 121: "PgDn", 115: "Home", 119: "End",
+]
+
+/// The hotkey that stops (or starts) forwarding. Needs at least two of Control / Option / Command so that
+/// it cannot swallow an everyday shortcut by accident. Default: Control+Option+Command+W.
+struct Hotkey: Equatable {
+    var code: UInt16 = 13  // kVK_ANSI_W
+    var flags: UInt64 = ctrlFlag | optFlag | cmdFlag
+    var name = "W"
+
+    /// Every required modifier must be down; extra ones (e.g. Shift) are tolerated, because in an emergency
+    /// the keys are not pressed carefully.
+    func matches(code c: UInt16, flags f: UInt64) -> Bool {
+        return c == code && (f & flags) == flags
+    }
+
+    var isValid: Bool {
+        var n = 0
+        if flags & ctrlFlag != 0 { n += 1 }
+        if flags & optFlag != 0 { n += 1 }
+        if flags & cmdFlag != 0 { n += 1 }
+        return n >= 2
+    }
+
+    var display: String {
+        var s = ""
+        if flags & ctrlFlag != 0 { s += "⌃" }
+        if flags & optFlag != 0 { s += "⌥" }
+        if flags & shiftFlag != 0 { s += "⇧" }
+        if flags & cmdFlag != 0 { s += "⌘" }
+        return s + name
+    }
+
+    var carbonModifiers: UInt32 {
+        var m: UInt32 = 0
+        if flags & cmdFlag != 0 { m |= UInt32(cmdKey) }
+        if flags & optFlag != 0 { m |= UInt32(optionKey) }
+        if flags & ctrlFlag != 0 { m |= UInt32(controlKey) }
+        if flags & shiftFlag != 0 { m |= UInt32(shiftKey) }
+        return m
+    }
+}
+
+// MARK: - Which of our events are still "open" (stuck-key protection)
+
+let modifierKeyCodes: Set<UInt16> = [54, 55, 56, 58, 59, 60, 61, 62, 63]  // Cmd, Shift, Option, Control (both sides), Fn
+
+/// Remembers which key / button presses were forwarded to the PC. Only those releases are forwarded and
+/// swallowed; the release of something that was pressed before forwarding started goes to the Mac, so
+/// neither computer is left with a key or button stuck down.
+struct HeldState {
+    private(set) var keys = Set<UInt16>()
+    private(set) var buttons = Set<UInt8>()
+
+    mutating func keyDown(_ code: UInt16) { keys.insert(code) }
+    /// true = this release belongs to a forwarded press.
+    mutating func keyUp(_ code: UInt16) -> Bool { return keys.remove(code) != nil }
+    mutating func buttonDown(_ b: UInt8) { buttons.insert(b) }
+    mutating func buttonUp(_ b: UInt8) -> Bool { return buttons.remove(b) != nil }
+    mutating func reset() {
+        keys.removeAll()
+        buttons.removeAll()
+    }
+    var modifiersHeld: Bool { return !keys.isDisjoint(with: modifierKeyCodes) }
+    var isEmpty: Bool { return keys.isEmpty && buttons.isEmpty }
+}
+
+// MARK: - Two-finger swipe recognizer (pure logic, no AppKit - covered by --selftest)
+
+enum ScrollPhaseKind { case none, mayBegin, began, changed, ended, cancelled }
+
+enum ScrollResult: Equatable {
+    case none
+    case scroll(x: Double, y: Double)  // forward these deltas as an ordinary scroll
+    case swipe(forward: Bool)          // one navigation step: true = next, false = previous
+}
+
+struct NavOptions {
+    var enabled = true
+    var threshold = 80.0   // finger travel (scroll points) that triggers a swipe
+    var output = 0         // what a swipe sends: 0 = Left / Right arrow, 1 = Page Up / Page Down, 2 = mouse side buttons (Back / Forward)
+    var reverse = false    // swap previous / next
+}
+
+/// Splits a trackpad scroll gesture into "navigation swipe" (horizontal) or "ordinary scroll" (vertical).
+///
+///  * The axis is decided once per gesture, after `lockDistance` points of travel. Until then the deltas are held back
+///    (about one or two events), so a vertical scroll starts a hair late but never leaks sideways.
+///  * A horizontal gesture fires exactly one swipe when the travel reaches `threshold`; the rest of that gesture and
+///    its inertia (momentum) events are ignored. A new gesture (phase "began") re-arms it.
+///  * Fingers moving left -> right = previous, right -> left = next.
+final class SwipeRecognizer {
+    private enum Axis { case undecided, horizontal, vertical }
+
+    let lockDistance = 10.0   // points of travel before the axis is decided
+    let dominance = 2.0       // |horizontal| must be at least this many times |vertical|
+    let cooldown = 0.25       // seconds between two swipes
+    let staleAfter = 0.6      // silence after which events are treated as a new gesture
+
+    private var axis = Axis.undecided
+    private var inGesture = false
+    private var sumX = 0.0, sumY = 0.0   // finger travel (X: + = right)
+    private var bufX = 0.0, bufY = 0.0   // raw deltas held back while the axis is undecided
+    private var fired = false
+    private var lastEvent = 0.0
+    private var lastFire = -100.0
+
+    func reset() {
+        axis = .undecided
+        inGesture = false
+        sumX = 0; sumY = 0; bufX = 0; bufY = 0
+        fired = false
+    }
+
+    /// rawX / rawY: scroll deltas exactly as macOS reports them (forwarded unchanged by the caller).
+    /// fingerX: horizontal finger movement (+ = fingers moved right), independent of "natural scrolling".
+    func feed(rawX: Double, rawY: Double, fingerX: Double, phase: ScrollPhaseKind, momentum: Bool,
+              threshold: Double, now: Double) -> ScrollResult {
+        if phase == .mayBegin { return .none }
+
+        if momentum {  // inertia of the gesture that just ended
+            if axis == .horizontal { return .none }
+            return rawY != 0 ? .scroll(x: 0, y: rawY) : .none
+        }
+
+        if phase == .began || !inGesture || now - lastEvent > staleAfter {
+            axis = .undecided
+            sumX = 0; sumY = 0; bufX = 0; bufY = 0
+            fired = false
+            inGesture = true
+        }
+        lastEvent = now
+        sumX += fingerX
+        sumY += rawY
+
+        var result = ScrollResult.none
+        switch axis {
+        case .undecided:
+            bufX += rawX
+            bufY += rawY
+            if abs(sumX) + abs(sumY) >= lockDistance {
+                if abs(sumX) >= dominance * abs(sumY) {
+                    axis = .horizontal
+                } else {
+                    axis = .vertical
+                    if bufY != 0 { result = .scroll(x: 0, y: bufY) }
+                }
+                bufX = 0; bufY = 0
+            }
+        case .vertical:
+            if rawY != 0 { result = .scroll(x: 0, y: rawY) }
+        case .horizontal:
+            break
+        }
+
+        if axis == .horizontal && !fired && abs(sumX) >= threshold && abs(sumX) >= dominance * abs(sumY) {
+            fired = true  // one swipe per gesture, even if it is dropped by the cooldown
+            if now - lastFire >= cooldown {
+                lastFire = now
+                result = .swipe(forward: sumX < 0)
+            }
+        }
+
+        if phase == .ended || phase == .cancelled {
+            if axis == .undecided && phase == .ended && bufY != 0 { result = .scroll(x: 0, y: bufY) }  // tiny vertical flick
+            bufX = 0; bufY = 0
+            inGesture = false  // `axis` stays, so the inertia that follows is classified like the gesture
+        }
+        return result
+    }
+}
+
+func scrollPhaseKind(_ p: NSEvent.Phase) -> ScrollPhaseKind {
+    if p.contains(.began) { return .began }
+    if p.contains(.ended) { return .ended }
+    if p.contains(.cancelled) { return .cancelled }
+    if p.contains(.changed) { return .changed }
+    if p.contains(.mayBegin) { return .mayBegin }
+    return .none
+}
+
+// MARK: - Mouse capture (detach the cursor, hide it, give it back)
+
+/// While active, the Mac cursor is detached from the mouse (CGAssociateMouseAndMouseCursorPosition(0)) and hidden, so
+/// the trackpad no longer drives macOS; its movement is still reported to the event tap as relative deltas.
+/// `release()` is idempotent and safe to call from any thread - it is the one function every emergency path uses.
+final class MouseCapture {
+    private let lock = NSLock()
+    private var active = false
+    private var anchor = CGPoint.zero
+    private var cursorHidden = false
+    private var lastReassert = 0.0
+    private var driftLogged = false
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
+    }
+
+    @discardableResult
+    func engage() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if active { return true }
+        anchor = CGEvent(source: nil)?.location ?? .zero
+        let err = CGAssociateMouseAndMouseCursorPosition(0)
+        if err != .success { say("Could not detach the Mac cursor (CGError \(err.rawValue))") }
+        // Hiding is cosmetic (macOS only honours it for the frontmost app); the detach above is what holds the cursor.
+        if CGDisplayHideCursor(CGMainDisplayID()) == .success { cursorHidden = true }
+        active = true
+        driftLogged = false
+        return err == .success
+    }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard active else { return }
+        active = false
+        CGAssociateMouseAndMouseCursorPosition(1)  // first: this is what gives the mouse back
+        if cursorHidden {
+            CGDisplayShowCursor(CGMainDisplayID())
+            cursorHidden = false
+        }
+        // If the cursor was moved anyway, put it back where it was when capture started.
+        if let now = CGEvent(source: nil)?.location, hypot(now.x - anchor.x, now.y - anchor.y) > 2 {
+            CGWarpMouseCursorPosition(anchor)
+        }
+    }
+
+    /// Called for every pointer-move event while captured: if the cursor position changed although it should be
+    /// frozen, the detach did not take effect (or was undone), so apply it again.
+    func checkDrift(_ loc: CGPoint) {
+        lock.lock()
+        guard active, hypot(loc.x - anchor.x, loc.y - anchor.y) > 3 else {
+            lock.unlock()
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let again = now - lastReassert > 0.5
+        if again { lastReassert = now }
+        let log = !driftLogged
+        driftLogged = true
+        lock.unlock()
+        if again { CGAssociateMouseAndMouseCursorPosition(0) }
+        if log { say("Cursor position changed while captured - re-applying the detach") }
+    }
+}
+
+// MARK: - Event taps
+
+let gestureEventTypes: [UInt32] = [18, 19, 20, 29, 30, 31, 32, 34]  // rotate, begin/end gesture, gesture, magnify, swipe, smart magnify, pressure
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 
 // NX_KEYTYPE_* values we forward as media keys (code = 0x100 + value on the wire).
 let forwardedMediaKeys: Set<Int> = [0, 1, 7, 16, 17, 18, 19, 20]  // vol up/down, mute, play, next, prev, ff, rew
@@ -544,6 +847,40 @@ final class Forwarder {
         link.enqueue([type, UInt8(x & 0xFF), UInt8(x >> 8), UInt8(y & 0xFF), UInt8(y >> 8)])
     }
 
+<<<<<<< HEAD
+=======
+    private func sendScroll(_ px: Double, _ py: Double) {
+        let k = 3.0 * mouse.scrollSpeed  // 120 wheel units (one notch) ~ 40 pixels
+        accSY += py * k * (mouse.invertV ? -1.0 : 1.0)
+        accSX += -px * k * (mouse.invertH ? -1.0 : 1.0)  // Mac + = scroll left, Windows + = scroll right
+        let iy = Int(accSY)
+        let ix = Int(accSX)
+        accSY -= Double(iy)
+        accSX -= Double(ix)
+        if ix != 0 || iy != 0 { sendPair(pktMouseWheel, ix, iy) }
+    }
+
+    /// One slide / page step, sent with the ordinary key or mouse-button packets (the wire protocol is unchanged).
+    private func sendSwipe(next: Bool) {
+        if nav.output == 2 {
+            // Mouse side buttons: button 3 = Back (previous), button 4 = Forward (next).
+            let button: UInt8 = next ? 4 : 3
+            link.enqueue([pktMouseButton, button, 1])
+            link.enqueue([pktMouseButton, button, 0])
+        } else {
+            let code: UInt16
+            if nav.output == 1 {
+                code = next ? 121 : 116  // Page Down / Page Up
+            } else {
+                code = next ? 124 : 123  // Right / Left arrow
+            }
+            sendKey(pktKeyDown, code)
+            sendKey(pktKeyUp, code)
+        }
+        say(next ? "Swipe: next slide / page" : "Swipe: previous slide / page")
+    }
+
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
     // MARK: event handling
 
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -859,6 +1196,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let lnButton = NSButton(title: "Open settings...", target: self, action: #selector(openLN))
         autoCheck = NSButton(checkboxWithTitle: "Connect automatically when the app starts", target: self, action: #selector(optionsChanged))
 
+<<<<<<< HEAD
+=======
+        hotkeyLabel = makeLabel("", width: 90)
+        hotkeyButton = NSButton(title: "Change...", target: self, action: #selector(changeHotkeyClicked))
+        hotkeyResetButton = NSButton(title: "Reset", target: self, action: #selector(resetHotkeyClicked))
+
+        navCheck = NSButton(checkboxWithTitle: "Two-finger horizontal swipe = previous / next slide or page", target: self, action: #selector(optionsChanged))
+        swipeSlider = NSSlider(value: 80, minValue: 30, maxValue: 300, target: self, action: #selector(optionsChanged))
+        swipeSlider.widthAnchor.constraint(equalToConstant: 230).isActive = true
+        swipeValue = makeLabel("80", width: 44)
+        swipeKeysPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        swipeKeysPopup.addItems(withTitles: ["Left / Right arrow", "Page Up / Page Down", "Mouse side buttons (Back / Forward)"])
+        swipeKeysPopup.target = self
+        swipeKeysPopup.action = #selector(optionsChanged)
+        swipeReverseCheck = NSButton(checkboxWithTitle: "Reverse swipe direction", target: self, action: #selector(optionsChanged))
+
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
         let scroll = NSTextView.scrollableTextView()
         logView = scroll.documentView as? NSTextView
         logView.isEditable = false
@@ -925,11 +1279,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         invertVCheck.state = prefs.invertV ? .on : .off
         invertHCheck.state = prefs.invertH ? .on : .off
         autoCheck.state = prefs.autoConnect ? .on : .off
+<<<<<<< HEAD
+=======
+        navCheck.state = prefs.swipeNav ? .on : .off
+        swipeSlider.doubleValue = prefs.swipeThreshold
+        swipeKeysPopup.selectItem(at: min(max(prefs.swipeKeys, 0), 2))
+        swipeReverseCheck.state = prefs.swipeReverse ? .on : .off
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
     }
 
     func applyMouseOptions() {
         gFwd.mouse = MouseOptions(enabled: prefs.forwardMouse, pointerSpeed: prefs.pointerSpeed,
                                   scrollSpeed: prefs.scrollSpeed, invertV: prefs.invertV, invertH: prefs.invertH)
+<<<<<<< HEAD
+=======
+        gFwd.nav = NavOptions(enabled: prefs.swipeNav, threshold: prefs.swipeThreshold,
+                              output: min(max(prefs.swipeKeys, 0), 2), reverse: prefs.swipeReverse)
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
         gFwd.updateMouseCapture()
     }
 
@@ -940,6 +1306,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         prefs.invertV = invertVCheck.state == .on
         prefs.invertH = invertHCheck.state == .on
         prefs.autoConnect = autoCheck.state == .on
+<<<<<<< HEAD
+=======
+        prefs.swipeNav = navCheck.state == .on
+        prefs.swipeThreshold = swipeSlider.doubleValue
+        prefs.swipeKeys = min(max(swipeKeysPopup.indexOfSelectedItem, 0), 2)
+        prefs.swipeReverse = swipeReverseCheck.state == .on
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
         applyMouseOptions()
         refreshUI()
     }

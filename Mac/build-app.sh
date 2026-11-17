@@ -31,8 +31,21 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+<<<<<<< HEAD
 # Ad-hoc signature: gives the app a stable identity for the macOS privacy permissions.
 codesign --force --sign - "$APP"
+=======
+# Ad-hoc signature: gives the app an identity for the macOS privacy permissions. Every rebuild changes it, so after
+# rebuilding re-grant Accessibility / Input Monitoring (see README, "Permissions"), or run:
+#   tccutil reset Accessibility local.mackeybridge.client; tccutil reset ListenEvent local.mackeybridge.client
+# A stable signing identity (see README, "Permissions") keeps the privacy permissions valid across rebuilds:
+#   SIGN_IDENTITY="MacKeyBridge Dev" ./build-app.sh
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+codesign --force --sign "$SIGN_IDENTITY" "$APP"
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "Signed ad-hoc: after every rebuild macOS may need the permissions granted again (README -> Permissions)."
+fi
+>>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 
 echo "Built $APP"
 open "$APP"
