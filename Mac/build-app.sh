@@ -20,8 +20,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>local.mackeybridge.client</string>
     <key>CFBundleExecutable</key><string>MacKeyBridge</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.0</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleShortVersionString</key><string>2.1</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -31,10 +31,6 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-<<<<<<< HEAD
-# Ad-hoc signature: gives the app a stable identity for the macOS privacy permissions.
-codesign --force --sign - "$APP"
-=======
 # Ad-hoc signature: gives the app an identity for the macOS privacy permissions. Every rebuild changes it, so after
 # rebuilding re-grant Accessibility / Input Monitoring (see README, "Permissions"), or run:
 #   tccutil reset Accessibility local.mackeybridge.client; tccutil reset ListenEvent local.mackeybridge.client
@@ -45,7 +41,6 @@ codesign --force --sign "$SIGN_IDENTITY" "$APP"
 if [ "$SIGN_IDENTITY" = "-" ]; then
     echo "Signed ad-hoc: after every rebuild macOS may need the permissions granted again (README -> Permissions)."
 fi
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 
 echo "Built $APP"
 open "$APP"
