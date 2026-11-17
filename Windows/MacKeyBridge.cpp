@@ -28,6 +28,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
@@ -38,9 +39,12 @@
 #include <bcrypt.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <objbase.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +53,7 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -109,14 +114,15 @@ void write(Level lvl, const char* fmt, ...)
 // ==========================================================================
 // Protocol.h
 // ==========================================================================
-// Wire protocol between the macOS client and the Windows server (version 2).
-// Mirrored by constants at the top of the macOS client (main.swift).
+// Wire protocol between the macOS client and the Windows server (version 3; version 2 clients are still
+// accepted, they just get no clipboard sync). Mirrored by constants at the top of the macOS client (main.swift).
 //
 // Handshake (once per TCP connection):
 //   server -> client : [0x01 CHALLENGE][16 random bytes]
 //   client -> server : [0x02 AUTH][version][32 bytes HMAC-SHA256(secret, nonce)]
 //   server -> client : [0x03 AUTH_OK]   or   [0x04 AUTH_FAIL][reason]  (then close)
 //                      reason: 1 = wrong secret, 2 = protocol version mismatch
+//   The client offers version 3 and falls back to 2 when an older server answers "version mismatch".
 //
 // Events (client -> server). The first byte is the type and determines the length:
 //   0x10 KEY_DOWN     [type][flags][code lo][code hi]            4 bytes (flags bit0 = auto-repeat)
@@ -129,9 +135,17 @@ void write(Level lvl, const char* fmt, ...)
 //   0x22 MOUSE_WHEEL  [type][dx lo][dx hi][dy lo][dy hi]         5 bytes, int16 LE, 120 = one notch,
 //                                                                          dy > 0 = up, dx > 0 = right
 // key code: macOS virtual key code (0..0xFF), or 0x100 + NX_KEYTYPE_* for media keys. Fn is code 63.
+//
+// Clipboard (protocol 3 only, both directions):
+//   0x30 CLIPBOARD    [type][kind][len u32 LE][payload]          6 + len bytes, kind 1 = UTF-8 text (LF line
+//                                                                          ends), 2 = PNG image; len <= 20 MiB
+//   0x31 CLIP_STATE   [type][flags]                              2 bytes, bit0 = sync on, bit1 = images accepted
+// Each side sends CLIP_STATE right after connecting and whenever its setting changes, and sends clipboard
+// contents only while the other side has announced "sync on".
 
 namespace proto {
-constexpr uint8_t  kVersion     = 2;
+constexpr uint8_t  kVersion     = 3;  // newest protocol we speak
+constexpr uint8_t  kMinVersion  = 2;  // oldest client we still accept (keyboard + trackpad, no clipboard)
 constexpr uint16_t kDefaultPort = 47800;
 constexpr size_t   kNonceLen    = 16;
 constexpr size_t   kMacLen      = 32;
@@ -150,6 +164,14 @@ constexpr uint8_t kMouseMove   = 0x20;
 constexpr uint8_t kMouseButton = 0x21;
 constexpr uint8_t kMouseWheel  = 0x22;
 
+constexpr uint8_t  kClipboard     = 0x30;
+constexpr uint8_t  kClipState     = 0x31;
+constexpr uint8_t  kClipText      = 1;
+constexpr uint8_t  kClipPng       = 2;
+constexpr uint8_t  kClipFlagOn    = 0x01;
+constexpr uint8_t  kClipFlagImages = 0x02;
+constexpr uint32_t kClipMaxBytes  = 20u * 1024u * 1024u;
+
 constexpr uint8_t kFlagRepeat   = 0x01;
 constexpr size_t  kMaxEventSize = 5;
 
@@ -163,6 +185,7 @@ inline size_t eventLength(uint8_t type) {
         case kMouseMove:
         case kMouseWheel:  return 5;
         case kMouseButton: return 3;
+        case kClipState:   return 2;  // protocol 3 only (checked by the server); CLIPBOARD has its own reader
         default:           return 0;
     }
 }
@@ -200,6 +223,9 @@ struct Config {
     std::string bindAddress = "0.0.0.0";
     int port = 47800;
     std::string secret;
+
+    // --- Clipboard (protocol 3) ---
+    bool clipboardSync = true;      // two-way clipboard sync with the Mac (text + images)
 
     // --- Startup / misc ---
     bool minimizeToTray = true;
@@ -451,7 +477,7 @@ private:
 class KeyboardManager;
 
 // TCP server: one MacBook client at a time, HMAC challenge-response authentication,
-// fixed 4-byte key events (see Protocol.h).
+// small fixed-size input events plus (protocol 3) clipboard messages in both directions (see Protocol.h).
 class NetworkServer {
 public:
     explicit NetworkServer(KeyboardManager& kb);
@@ -463,12 +489,29 @@ public:
     bool running() const { return running_; }
     std::string clientAddress() const;  // empty when nobody is connected
 
+    // --- clipboard (thread-safe) ---
+    struct ClipPeer {
+        int version = 0;      // protocol of the connected Mac, 0 = nobody connected
+        bool on = false;      // the Mac announced "clipboard sync on"
+        bool images = false;  // ... and accepts images
+    };
+    ClipPeer clipPeer() const;
+    // Our own switch; announced to the Mac now and on every new connection.
+    void setClipboardEnabled(bool on);
+    // Queue clipboard contents for the Mac. Returns false (and sends nothing) unless a protocol-3 Mac with
+    // clipboard sync on is connected (and accepts images, for kClipPng).
+    bool sendClipboard(uint8_t kind, const std::vector<uint8_t>& data);
+
     std::function<void()> onStatus;  // called from the network thread whenever the state changes
+    // Clipboard contents from the Mac; called on the network thread.
+    std::function<void(uint8_t kind, std::vector<uint8_t>&& data)> onClipboard;
 
 private:
     void acceptLoop(SOCKET listenSock);
-    bool handshake(SOCKET s);
-    void serve(SOCKET s, const std::string& peer);
+    bool handshake(SOCKET s, uint8_t& version);
+    void serve(SOCKET s, const std::string& peer, uint8_t version);
+    void writerLoop(SOCKET s);
+    void queueLocked(std::vector<uint8_t> msg);  // mu_ held
     void notify() {
         if (onStatus) onStatus();
     }
@@ -483,6 +526,15 @@ private:
     mutable std::mutex mu_;
     std::string client_;
     SOCKET active_ = INVALID_SOCKET;
+
+    // Outgoing messages after the handshake (clipboard): written by one writer thread per connection, so the
+    // UI thread never blocks on the network. All guarded by mu_.
+    std::condition_variable outCv_;
+    std::deque<std::vector<uint8_t>> outbox_;
+    bool outClosed_ = true;
+    int version_ = 0;
+    bool peerClip_ = false, peerImages_ = false;
+    bool localClip_ = true;
 };
 
 
@@ -688,6 +740,8 @@ bool Settings::load() {
         c.port = (int)GetPrivateProfileIntW(L"Connection", L"port", c.port, P);
         c.secret = narrow(getStr(path_, L"Connection", L"secret", L""));
 
+        c.clipboardSync = B(L"Clipboard", L"sync", c.clipboardSync);
+
         c.minimizeToTray = B(L"Startup", L"minimizeToTray", c.minimizeToTray);
         c.debug = B(L"Startup", L"debug", c.debug);
     }
@@ -740,6 +794,8 @@ void Settings::save(const Config& c) const {
     putStr(P, L"Connection", L"bindAddress", widen(c.bindAddress));
     putInt(P, L"Connection", L"port", c.port);
     putStr(P, L"Connection", L"secret", widen(c.secret));
+
+    putStr(P, L"Clipboard", L"sync", b(c.clipboardSync));
 
     putStr(P, L"Startup", L"minimizeToTray", b(c.minimizeToTray));
     putStr(P, L"Startup", L"debug", b(c.debug));
@@ -1733,9 +1789,10 @@ void NetworkServer::acceptLoop(SOCKET ls) {
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo);
         setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof tmo);
 
-        if (handshake(c)) {
+        uint8_t version = 0;
+        if (handshake(c, version)) {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-            serve(c, ip);
+            serve(c, ip, version);
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
         } else {
             LOG_WARN("Rejected connection from %s (bad secret or protocol)", ip);
@@ -1744,7 +1801,7 @@ void NetworkServer::acceptLoop(SOCKET ls) {
     }
 }
 
-bool NetworkServer::handshake(SOCKET s) {
+bool NetworkServer::handshake(SOCKET s, uint8_t& version) {
     uint8_t nonce[proto::kNonceLen];
     if (BCryptGenRandom(nullptr, nonce, (ULONG)sizeof nonce, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return false;
 
@@ -1756,7 +1813,7 @@ bool NetworkServer::handshake(SOCKET s) {
     uint8_t resp[2 + proto::kMacLen];
     if (!recvAll(s, resp, (int)sizeof resp)) return false;
     if (resp[0] != proto::kAuth) return false;
-    if (resp[1] != proto::kVersion) {
+    if (resp[1] < proto::kMinVersion || resp[1] > proto::kVersion) {
         const uint8_t fail[2] = {proto::kAuthFail, 2};  // 2 = version mismatch
         sendAll(s, fail, 2);
         return false;
@@ -1773,23 +1830,49 @@ bool NetworkServer::handshake(SOCKET s) {
         return false;
     }
     const uint8_t ok = proto::kAuthOk;
+    version = resp[1];
     return sendAll(s, &ok, 1);
 }
 
-void NetworkServer::serve(SOCKET s, const std::string& peer) {
+void NetworkServer::serve(SOCKET s, const std::string& peer, uint8_t version) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         client_ = peer;
         active_ = s;
+        version_ = version;
+        peerClip_ = peerImages_ = false;
+        outbox_.clear();
+        outClosed_ = false;
+        if (version >= 3) {  // tell the Mac right away whether we take part in clipboard sync
+            const uint8_t f = localClip_ ? (uint8_t)(proto::kClipFlagOn | proto::kClipFlagImages) : (uint8_t)0;
+            queueLocked({proto::kClipState, f});
+        }
     }
-    LOG_INFO("Connected to MacBook (%s)", peer.c_str());
+    std::thread writer(&NetworkServer::writerLoop, this, s);
+    LOG_INFO("Connected to MacBook (%s, protocol %u%s)", peer.c_str(), (unsigned)version,
+             version >= 3 ? "" : ", no clipboard sync - update the Mac app");
     notify();
 
     uint8_t ev[proto::kMaxEventSize];
     bool bad = false;
     while (!stop_ && !bad) {
         if (!recvAll(s, ev, 1)) break;
-        const size_t len = proto::eventLength(ev[0]);
+        if (ev[0] == proto::kClipboard && version >= 3) {
+            uint8_t hdr[5];  // kind + u32 length
+            if (!recvAll(s, hdr, 5)) break;
+            const uint32_t n = (uint32_t)hdr[1] | ((uint32_t)hdr[2] << 8) | ((uint32_t)hdr[3] << 16) |
+                               ((uint32_t)hdr[4] << 24);
+            if (n > proto::kClipMaxBytes) {
+                LOG_WARN("Clipboard from %s is too large (%u bytes), dropping connection", peer.c_str(), (unsigned)n);
+                break;
+            }
+            std::vector<uint8_t> data(n);
+            if (n > 0 && !recvAll(s, data.data(), (int)n)) break;
+            if (onClipboard) onClipboard(hdr[0], std::move(data));
+            continue;
+        }
+        size_t len = proto::eventLength(ev[0]);
+        if (ev[0] == proto::kClipState && version < 3) len = 0;
         if (len == 0) {
             LOG_WARN("Unknown packet type 0x%02X from %s, dropping connection", ev[0], peer.c_str());
             break;
@@ -1817,6 +1900,17 @@ void NetworkServer::serve(SOCKET s, const std::string& peer) {
             case proto::kMouseWheel:
                 kb_.onMouseWheel((int16_t)(ev[1] | (ev[2] << 8)), (int16_t)(ev[3] | (ev[4] << 8)));
                 break;
+            case proto::kClipState: {
+                const bool on = (ev[1] & proto::kClipFlagOn) != 0;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    peerClip_ = on;
+                    peerImages_ = on && (ev[1] & proto::kClipFlagImages) != 0;
+                }
+                LOG_INFO("Mac clipboard sync: %s", on ? "on" : "off");
+                notify();
+                break;
+            }
             default:
                 bad = true;
                 break;
@@ -1827,9 +1921,91 @@ void NetworkServer::serve(SOCKET s, const std::string& peer) {
         std::lock_guard<std::mutex> lk(mu_);
         client_.clear();
         active_ = INVALID_SOCKET;
+        version_ = 0;
+        peerClip_ = peerImages_ = false;
+        outClosed_ = true;
+        outbox_.clear();
     }
+    outCv_.notify_all();
+    shutdown(s, SD_BOTH);  // unblocks a send() the writer may be stuck in
+    writer.join();
     LOG_INFO("MacBook disconnected (%s)", peer.c_str());
     notify();
+}
+
+void NetworkServer::writerLoop(SOCKET s) {
+    for (;;) {
+        std::vector<uint8_t> msg;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            outCv_.wait(lk, [this] { return outClosed_ || !outbox_.empty(); });
+            if (outClosed_) return;
+            msg = std::move(outbox_.front());
+            outbox_.pop_front();
+        }
+        // 64 KB at a time: the 3 s send timeout then applies to a small piece, not to a whole image.
+        size_t off = 0;
+        while (off < msg.size()) {
+            const int n = (int)std::min<size_t>(64 * 1024, msg.size() - off);
+            if (!sendAll(s, msg.data() + off, n)) {
+                LOG_WARN("Sending to the Mac failed - closing the connection");
+                shutdown(s, SD_BOTH);  // the reader notices and cleans up
+                return;
+            }
+            off += (size_t)n;
+        }
+    }
+}
+
+void NetworkServer::queueLocked(std::vector<uint8_t> msg) {
+    if (outClosed_) return;
+    outbox_.push_back(std::move(msg));
+    outCv_.notify_one();
+}
+
+NetworkServer::ClipPeer NetworkServer::clipPeer() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    ClipPeer p;
+    p.version = version_;
+    p.on = peerClip_;
+    p.images = peerImages_;
+    return p;
+}
+
+void NetworkServer::setClipboardEnabled(bool on) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (localClip_ == on) return;
+    localClip_ = on;
+    if (active_ != INVALID_SOCKET && version_ >= 3) {
+        const uint8_t f = on ? (uint8_t)(proto::kClipFlagOn | proto::kClipFlagImages) : (uint8_t)0;
+        queueLocked({proto::kClipState, f});
+    }
+}
+
+bool NetworkServer::sendClipboard(uint8_t kind, const std::vector<uint8_t>& data) {
+    if (data.size() > proto::kClipMaxBytes) return false;
+    auto ready = [&] {
+        return active_ != INVALID_SOCKET && !outClosed_ && version_ >= 3 && localClip_ && peerClip_ &&
+               (kind != proto::kClipPng || peerImages_);
+    };
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!ready()) return false;
+    }
+    std::vector<uint8_t> msg;  // built outside the lock (it may be megabytes)
+    msg.reserve(6 + data.size());
+    const uint32_t n = (uint32_t)data.size();
+    msg.push_back(proto::kClipboard);
+    msg.push_back(kind);
+    msg.push_back((uint8_t)(n & 0xFF));
+    msg.push_back((uint8_t)((n >> 8) & 0xFF));
+    msg.push_back((uint8_t)((n >> 16) & 0xFF));
+    msg.push_back((uint8_t)(n >> 24));
+    msg.insert(msg.end(), data.begin(), data.end());
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!ready()) return false;
+    queueLocked(std::move(msg));
+    return true;
 }
 
 
@@ -1961,6 +2137,360 @@ void TrayIcon::remove() {
 
 
 // ==========================================================================
+// Clipboard.cpp
+// ==========================================================================
+// Windows side of the two-way clipboard sync (protocol 3): text (CF_UNICODETEXT <-> UTF-8 with LF line ends) and
+// images (the registered "PNG" format and CF_DIB <-> PNG bytes). PNG encoding / decoding uses WIC, which is part of
+// Windows; the WIC GUIDs are spelled out here so that no extra import library is needed (only ole32).
+// All functions run on the UI thread (the clipboard is owned by the hidden main window).
+namespace Clip {
+
+struct Item {
+    uint8_t kind = 0;
+    std::vector<uint8_t> data;
+    std::string summary;  // for the log / settings window, e.g. "Text, 42 characters"
+};
+
+namespace {
+
+const CLSID kClsidWicFactory = {0xcacaf262, 0x9370, 0x4615, {0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a}};
+const IID kIidWicFactory = {0xec5ec8a9, 0xc395, 0x4314, {0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70}};
+const GUID kContainerPng = {0x1b7cfaf4, 0x713f, 0x473c, {0xbb, 0xcd, 0x61, 0x37, 0x42, 0x5f, 0xae, 0xaf}};
+const GUID kPixel32bppBGRA = {0x6fddc324, 0x4e03, 0x4bfe, {0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f}};
+
+// Minimal COM smart pointer (no WRL/ATL dependency, builds with MinGW too).
+template <class T>
+struct Com {
+    T* p = nullptr;
+    Com() = default;
+    Com(const Com&) = delete;
+    Com& operator=(const Com&) = delete;
+    ~Com() {
+        if (p) p->Release();
+    }
+    T* operator->() const { return p; }
+    T** put() { return &p; }
+    explicit operator bool() const { return p != nullptr; }
+};
+
+UINT fmtPng() {
+    static UINT f = RegisterClipboardFormatW(L"PNG");
+    return f;
+}
+UINT fmtMarker() {  // put next to everything we write, so our own change is not sent back to the Mac
+    static UINT f = RegisterClipboardFormatW(L"MacKeyBridge.FromMac");
+    return f;
+}
+UINT fmtExclude() {  // password managers: "do not monitor / sync this"
+    static UINT f = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+    return f;
+}
+UINT fmtHistory() {  // DWORD 0 = "keep out of clipboard history" (also set by password managers)
+    static UINT f = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
+    return f;
+}
+UINT fmtViewerIgnore() {
+    static UINT f = RegisterClipboardFormatW(L"Clipboard Viewer Ignore");
+    return f;
+}
+
+bool openClipboard(HWND owner) {
+    for (int i = 0; i < 10; ++i) {  // another program may hold it for a moment
+        if (OpenClipboard(owner)) return true;
+        Sleep(15);
+    }
+    return false;
+}
+
+struct ClipboardCloser {
+    ~ClipboardCloser() { CloseClipboard(); }
+};
+
+std::string sizeText(size_t n) {
+    char b[48];
+    if (n >= 1024 * 1024) snprintf(b, sizeof b, "%.1f MB", n / (1024.0 * 1024.0));
+    else if (n >= 1024) snprintf(b, sizeof b, "%u KB", (unsigned)((n + 512) / 1024));
+    else snprintf(b, sizeof b, "%u bytes", (unsigned)n);
+    return b;
+}
+
+std::string imageSummary(UINT w, UINT h, size_t bytes) {
+    char b[96];
+    snprintf(b, sizeof b, "Image, %ux%u, ", w, h);
+    return b + sizeText(bytes);
+}
+
+// Width and height from a PNG's IHDR chunk (no decoding needed).
+bool pngSize(const std::vector<uint8_t>& p, UINT& w, UINT& h) {
+    if (p.size() < 24 || p[0] != 0x89 || p[1] != 'P' || p[2] != 'N' || p[3] != 'G') return false;
+    w = ((UINT)p[16] << 24) | ((UINT)p[17] << 16) | ((UINT)p[18] << 8) | p[19];
+    h = ((UINT)p[20] << 24) | ((UINT)p[21] << 16) | ((UINT)p[22] << 8) | p[23];
+    return true;
+}
+
+bool wicFactory(Com<IWICImagingFactory>& f) {
+    return SUCCEEDED(CoCreateInstance(kClsidWicFactory, nullptr, CLSCTX_INPROC_SERVER, kIidWicFactory,
+                                      (void**)f.put()));
+}
+
+// HBITMAP (CF_BITMAP, synthesized by Windows from CF_DIB / CF_DIBV5) -> PNG bytes.
+bool pngFromBitmap(HBITMAP hbm, HPALETTE pal, std::vector<uint8_t>& out, UINT& w, UINT& h) {
+    Com<IWICImagingFactory> f;
+    if (!wicFactory(f)) return false;
+    Com<IWICBitmap> bmp;
+    if (FAILED(f->CreateBitmapFromHBITMAP(hbm, pal, WICBitmapIgnoreAlpha, bmp.put()))) return false;
+    if (FAILED(bmp->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+
+    Com<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, stream.put()))) return false;
+    Com<IWICBitmapEncoder> enc;
+    if (FAILED(f->CreateEncoder(kContainerPng, nullptr, enc.put()))) return false;
+    if (FAILED(enc->Initialize(stream.p, WICBitmapEncoderNoCache))) return false;
+    Com<IWICBitmapFrameEncode> frame;
+    Com<IPropertyBag2> props;
+    if (FAILED(enc->CreateNewFrame(frame.put(), props.put()))) return false;
+    if (FAILED(frame->Initialize(props.p))) return false;
+    if (FAILED(frame->SetSize(w, h))) return false;
+    WICPixelFormatGUID pf = kPixel32bppBGRA;
+    if (FAILED(frame->SetPixelFormat(&pf))) return false;  // the encoder may pick a close format; WriteSource converts
+    if (FAILED(frame->WriteSource(bmp.p, nullptr))) return false;
+    if (FAILED(frame->Commit()) || FAILED(enc->Commit())) return false;
+
+    STATSTG st{};
+    if (FAILED(stream->Stat(&st, STATFLAG_NONAME))) return false;
+    HGLOBAL g = nullptr;
+    if (FAILED(GetHGlobalFromStream(stream.p, &g))) return false;
+    const size_t n = (size_t)st.cbSize.QuadPart;
+    const void* src = GlobalLock(g);
+    if (!src) return false;
+    out.assign((const uint8_t*)src, (const uint8_t*)src + n);
+    GlobalUnlock(g);
+    return !out.empty();
+}
+
+// PNG bytes -> CF_DIB (32 bpp, bottom-up). Transparent areas are blended onto white, because most programs ignore
+// the alpha of a CF_DIB; programs that understand transparency read the "PNG" format we put next to it.
+HGLOBAL dibFromPng(const std::vector<uint8_t>& png, UINT& w, UINT& h) {
+    Com<IWICImagingFactory> f;
+    if (!wicFactory(f)) return nullptr;
+    Com<IWICStream> ws;
+    if (FAILED(f->CreateStream(ws.put()))) return nullptr;
+    if (FAILED(ws->InitializeFromMemory((BYTE*)png.data(), (DWORD)png.size()))) return nullptr;
+    Com<IWICBitmapDecoder> dec;
+    if (FAILED(f->CreateDecoderFromStream(ws.p, nullptr, WICDecodeMetadataCacheOnDemand, dec.put()))) return nullptr;
+    Com<IWICBitmapFrameDecode> frame;
+    if (FAILED(dec->GetFrame(0, frame.put()))) return nullptr;
+    Com<IWICFormatConverter> conv;
+    if (FAILED(f->CreateFormatConverter(conv.put()))) return nullptr;
+    if (FAILED(conv->Initialize(frame.p, kPixel32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                WICBitmapPaletteTypeCustom)))
+        return nullptr;
+    if (FAILED(conv->GetSize(&w, &h)) || w == 0 || h == 0) return nullptr;
+
+    const uint64_t stride = (uint64_t)w * 4;
+    const uint64_t bytes = stride * h;
+    if (bytes > 512ull * 1024 * 1024) return nullptr;  // absurd size: refuse rather than allocate
+    std::vector<uint8_t> px((size_t)bytes);
+    if (FAILED(conv->CopyPixels(nullptr, (UINT)stride, (UINT)bytes, px.data()))) return nullptr;
+
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + (SIZE_T)bytes);
+    if (!g) return nullptr;
+    uint8_t* dst = (uint8_t*)GlobalLock(g);
+    if (!dst) {
+        GlobalFree(g);
+        return nullptr;
+    }
+    BITMAPINFOHEADER bi{};
+    bi.biSize = sizeof bi;
+    bi.biWidth = (LONG)w;
+    bi.biHeight = (LONG)h;  // positive = bottom-up, the form every program reads correctly
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = BI_RGB;
+    bi.biSizeImage = (DWORD)bytes;
+    memcpy(dst, &bi, sizeof bi);
+    uint8_t* bits = dst + sizeof bi;
+    for (UINT y = 0; y < h; ++y) {
+        const uint8_t* s = px.data() + (size_t)y * stride;
+        uint8_t* d = bits + (size_t)(h - 1 - y) * stride;
+        for (UINT x = 0; x < w; ++x, s += 4, d += 4) {
+            const unsigned a = s[3];
+            d[0] = (uint8_t)((s[0] * a + 255 * (255 - a)) / 255);
+            d[1] = (uint8_t)((s[1] * a + 255 * (255 - a)) / 255);
+            d[2] = (uint8_t)((s[2] * a + 255 * (255 - a)) / 255);
+            d[3] = 255;
+        }
+    }
+    GlobalUnlock(g);
+    return g;
+}
+
+HGLOBAL globalCopy(const void* p, size_t n) {
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n ? n : 1);
+    if (!g) return nullptr;
+    void* d = GlobalLock(g);
+    if (!d) {
+        GlobalFree(g);
+        return nullptr;
+    }
+    if (n) memcpy(d, p, n);
+    GlobalUnlock(g);
+    return g;
+}
+
+// Hands ownership to the clipboard, or frees the memory if that fails.
+void setData(UINT fmt, HGLOBAL g) {
+    if (g && !SetClipboardData(fmt, g)) GlobalFree(g);
+}
+
+std::string textSummary(const std::wstring& w) {
+    return "Text, " + std::to_string(w.size()) + (w.size() == 1 ? " character" : " characters");
+}
+
+}  // namespace
+
+// Reads the current clipboard. Returns false when there is nothing to send; `why` is set when the reason is worth
+// a log line (private content, files, too large, busy).
+bool read(HWND owner, bool images, Item& out, std::string& why) {
+    if (!openClipboard(owner)) {
+        why = "the clipboard is busy";
+        return false;
+    }
+    ClipboardCloser closer;
+
+    if (IsClipboardFormatAvailable(fmtMarker())) return false;  // we wrote it ourselves (it came from the Mac)
+    if (IsClipboardFormatAvailable(fmtExclude()) || IsClipboardFormatAvailable(fmtViewerIgnore())) {
+        why = "the program that copied it marked it as private";
+        return false;
+    }
+    if (IsClipboardFormatAvailable(fmtHistory())) {
+        if (HANDLE hh = GetClipboardData(fmtHistory())) {
+            const DWORD* v = (const DWORD*)GlobalLock(hh);
+            const bool privateData = v && GlobalSize(hh) >= sizeof(DWORD) && *v == 0;
+            if (v) GlobalUnlock(hh);
+            if (privateData) {
+                why = "the program that copied it marked it as private";
+                return false;
+            }
+        }
+    }
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        why = "files are not synced (only text and images)";
+        return false;
+    }
+
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        HANDLE hd = GetClipboardData(CF_UNICODETEXT);
+        if (!hd) return false;
+        const wchar_t* p = (const wchar_t*)GlobalLock(hd);
+        if (!p) return false;
+        const size_t cap = GlobalSize(hd) / sizeof(wchar_t);
+        size_t len = 0;
+        while (len < cap && p[len]) ++len;
+        std::wstring w;
+        w.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            if (p[i] == L'\r' && i + 1 < len && p[i + 1] == L'\n') continue;  // CRLF -> LF (the Mac's line end)
+            w.push_back(p[i]);
+        }
+        GlobalUnlock(hd);
+        if (w.empty()) return false;
+        const std::string u = narrow(w);
+        out.kind = proto::kClipText;
+        out.data.assign(u.begin(), u.end());
+        out.summary = textSummary(w);
+    } else if (images && IsClipboardFormatAvailable(fmtPng())) {
+        HANDLE hd = GetClipboardData(fmtPng());
+        if (!hd) return false;
+        const uint8_t* p = (const uint8_t*)GlobalLock(hd);
+        if (!p) return false;
+        out.data.assign(p, p + GlobalSize(hd));
+        GlobalUnlock(hd);
+        UINT w = 0, h = 0;
+        if (!pngSize(out.data, w, h)) return false;
+        out.kind = proto::kClipPng;
+        out.summary = imageSummary(w, h, out.data.size());
+    } else if (images && IsClipboardFormatAvailable(CF_BITMAP)) {
+        HBITMAP hb = (HBITMAP)GetClipboardData(CF_BITMAP);
+        HPALETTE pal = IsClipboardFormatAvailable(CF_PALETTE) ? (HPALETTE)GetClipboardData(CF_PALETTE) : nullptr;
+        UINT w = 0, h = 0;
+        if (!hb || !pngFromBitmap(hb, pal, out.data, w, h)) {
+            why = "the image could not be converted to PNG";
+            return false;
+        }
+        out.kind = proto::kClipPng;
+        out.summary = imageSummary(w, h, out.data.size());
+    } else {
+        return false;  // nothing we sync (or images are not wanted by the Mac)
+    }
+
+    if (out.data.size() > proto::kClipMaxBytes) {
+        why = out.summary + " is larger than the " + sizeText(proto::kClipMaxBytes) + " limit";
+        return false;
+    }
+    return true;
+}
+
+// Puts contents received from the Mac on the clipboard.
+bool write(HWND owner, uint8_t kind, const std::vector<uint8_t>& data, std::string& summary) {
+    if (kind == proto::kClipText) {
+        const std::wstring in = widen(std::string(data.begin(), data.end()));
+        std::wstring w;
+        w.reserve(in.size() + in.size() / 16);
+        for (size_t i = 0; i < in.size(); ++i) {  // LF -> CRLF (existing CRLF stays as it is)
+            if (in[i] == L'\n' && (i == 0 || in[i - 1] != L'\r')) w.push_back(L'\r');
+            w.push_back(in[i]);
+        }
+        HGLOBAL g = globalCopy(w.c_str(), (w.size() + 1) * sizeof(wchar_t));
+        if (!g) return false;
+        if (!openClipboard(owner)) {
+            GlobalFree(g);
+            return false;
+        }
+        EmptyClipboard();
+        setData(CF_UNICODETEXT, g);
+        setData(fmtMarker(), globalCopy("", 1));
+        CloseClipboard();
+        summary = textSummary(in);
+        return true;
+    }
+    if (kind == proto::kClipPng) {
+        UINT w = 0, h = 0;
+        HGLOBAL dib = dibFromPng(data, w, h);
+        if (!dib) return false;
+        HGLOBAL png = globalCopy(data.data(), data.size());
+        if (!openClipboard(owner)) {
+            GlobalFree(dib);
+            if (png) GlobalFree(png);
+            return false;
+        }
+        EmptyClipboard();
+        setData(fmtPng(), png);
+        setData(CF_DIB, dib);
+        setData(fmtMarker(), globalCopy("", 1));
+        CloseClipboard();
+        summary = imageSummary(w, h, data.size());
+        return true;
+    }
+    return false;  // a format from a newer version
+}
+
+// FNV-1a over kind + data: "is this exactly what we sent / received last time?" (stops ping-pong).
+uint64_t hash(uint8_t kind, const std::vector<uint8_t>& data) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint8_t b) {
+        h ^= b;
+        h *= 1099511628211ull;
+    };
+    mix(kind);
+    for (uint8_t b : data) mix(b);
+    return h;
+}
+
+}  // namespace Clip
+
+
+// ==========================================================================
 // UI.cpp
 // ==========================================================================
 namespace {
@@ -1968,15 +2498,22 @@ namespace {
 constexpr UINT WM_TRAY = WM_APP + 1;    // tray icon callback
 constexpr UINT WM_STATUS = WM_APP + 2;  // network state changed
 constexpr UINT WM_TRACE = WM_APP + 3;   // lParam = heap TraceEvent*
+constexpr UINT WM_CLIPIN = WM_APP + 4;  // lParam = heap ClipIn* (clipboard received from the Mac)
+constexpr UINT_PTR kTimerTray = 1, kTimerClipboard = 2;
 
-enum : int { ID_ENABLE = 100, ID_DISABLE, ID_SETTINGS, ID_TEST, ID_AUTOSTART, ID_EXIT };
+struct ClipIn {
+    uint8_t kind = 0;
+    std::vector<uint8_t> data;
+};
+
+enum : int { ID_ENABLE = 100, ID_DISABLE, ID_SETTINGS, ID_TEST, ID_AUTOSTART, ID_CLIPBOARD, ID_EXIT };
 
 enum : int {
     IDC_TAB = 200,
     IDC_MACMODE, IDC_CMDSC, IDC_RCMDWIN, IDC_TEXTNAV, IDC_OPTALT, IDC_FNLANG, IDC_FNLAYER, IDC_ISO,
     IDC_LANG1, IDC_LANG2, IDC_LANG3, IDC_METHOD, IDC_CURLANG, IDC_DETECT,
     IDC_ADDR, IDC_PORT, IDC_SECRET, IDC_STATUS, IDC_LOCALIPS, IDC_CMDLINE,
-    IDC_AUTOSTART, IDC_MINTRAY, IDC_DEBUG,
+    IDC_AUTOSTART, IDC_MINTRAY, IDC_DEBUG, IDC_CLIPSYNC, IDC_CLIPSTATUS,
     IDC_SAVE, IDC_CLOSE, IDC_OPENTEST,
     IDC_DRYRUN, IDC_PHYS, IDC_DET, IDC_SCAN, IDC_VK, IDC_MAPPED, IDC_LOG
 };
@@ -1995,6 +2532,8 @@ struct AppState {
     int dpi = 96;
     std::vector<std::pair<HWND, int>> pages;  // control -> settings tab index
     std::vector<std::string> ips;
+    uint64_t clipHash = 0;  // last clipboard content sent or received (no ping-pong)
+    std::string clipLast;   // "sent Text, 12 characters" for the settings window
 } S;
 
 int sc(int v) { return MulDiv(v, S.dpi, 96); }
@@ -2065,9 +2604,23 @@ HKL currentForeignLayout() {
 }
 
 
+std::wstring clipStatusText() {
+    auto c = Settings::instance().get();
+    if (!c->clipboardSync) return L"Clipboard sync: off";
+    const auto peer = S.net->clipPeer();
+    std::wstring t;
+    if (peer.version == 0) t = L"Clipboard sync: on - waiting for the Mac";
+    else if (peer.version < 3) t = L"Clipboard sync: the Mac app is too old - update it";
+    else if (!peer.on) t = L"Clipboard sync: switched off on the Mac";
+    else t = L"Clipboard sync: active";
+    if (!S.clipLast.empty()) t += L"  (last: " + widen(S.clipLast) + L")";
+    return t;
+}
+
 void refreshSettingsStatus() {
     if (!S.settings) return;
     SetDlgItemTextW(S.settings, IDC_STATUS, statusText().c_str());
+    SetDlgItemTextW(S.settings, IDC_CLIPSTATUS, clipStatusText().c_str());
     LANGID l = langOf(currentForeignLayout());
     std::wstring t = L"Current Windows layout: " + LanguageManager::code3(l) + L"  (" +
                      LanguageManager::displayName(l) + L")";
@@ -2090,6 +2643,7 @@ void refreshTray() {
 void applyConfig() {
     auto c = Settings::instance().get();
     Log::setDebug(c->debug);
+    S.net->setClipboardEnabled(c->clipboardSync);  // announced to the Mac (now, and on every new connection)
     const std::string key = c->bindAddress + ":" + std::to_string(c->port) + "/" + c->secret;
     if (c->enabled) {
         if (!S.net->running() || key != S.lastNetKey) {
@@ -2172,6 +2726,7 @@ void loadUi(HWND h) {
     chk(IDC_AUTOSTART, autostartEnabled());
     chk(IDC_MINTRAY, c.minimizeToTray);
     chk(IDC_DEBUG, c.debug);
+    chk(IDC_CLIPSYNC, c.clipboardSync);
 
     std::wstring ips;
     for (const auto& ip : S.ips) ips += (ips.empty() ? L"" : L", ") + widen(ip);
@@ -2231,6 +2786,7 @@ bool saveUi(HWND h) {
     c.secret = secret;
     c.minimizeToTray = on(IDC_MINTRAY);
     c.debug = on(IDC_DEBUG);
+    c.clipboardSync = on(IDC_CLIPSYNC);
 
     setAutostart(on(IDC_AUTOSTART));
     Settings::instance().set(c);  // saves + applyConfig()
@@ -2317,7 +2873,10 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             label(2, L"On the MacBook run:", 24, 192, 300);
             edit(2, IDC_CMDLINE, 24, 216, 486, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL);
             SetWindowPos(GetDlgItem(h, IDC_CMDLINE), nullptr, 0, 0, sc(486), sc(70), SWP_NOMOVE | SWP_NOZORDER);
-            label(2, L"Keys are not encrypted: use a trusted network (or a VPN such as Tailscale).", 24, 300, 490);
+            label(2, L"Keys and clipboard are not encrypted: use a trusted network (or a VPN such as Tailscale).", 24,
+                  296, 490);
+            check(2, L"Sync the clipboard with the Mac (text and images, both directions)", IDC_CLIPSYNC, 322);
+            label(2, L"", 24, 350, 490, 20, IDC_CLIPSTATUS);
 
             // --- page 3: Startup
             check(3, L"Start with Windows", IDC_AUTOSTART, 52);
@@ -2485,6 +3044,7 @@ void showMenu(HWND hwnd) {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_SETTINGS, L"Settings...");
     AppendMenuW(m, MF_STRING, ID_TEST, L"Keyboard Test...");
+    AppendMenuW(m, MF_STRING | (c->clipboardSync ? MF_CHECKED : 0), ID_CLIPBOARD, L"Sync clipboard with Mac");
     AppendMenuW(m, MF_STRING | (autostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
@@ -2496,6 +3056,41 @@ void showMenu(HWND hwnd) {
     DestroyMenu(m);
 }
 
+// The Windows clipboard changed (debounced): send it to the Mac if both sides have clipboard sync on.
+void onLocalClipboardChanged() {
+    if (!Settings::instance().get()->clipboardSync) return;
+    const auto peer = S.net->clipPeer();
+    if (peer.version < 3 || !peer.on) return;
+    Clip::Item it;
+    std::string why;
+    if (!Clip::read(S.main, peer.images, it, why)) {
+        if (!why.empty()) LOG_INFO("Clipboard not sent to the Mac: %s", why.c_str());
+        return;
+    }
+    const uint64_t h = Clip::hash(it.kind, it.data);
+    if (h == S.clipHash) return;  // the Mac already has exactly this
+    if (S.net->sendClipboard(it.kind, it.data)) {
+        S.clipHash = h;
+        S.clipLast = "sent " + it.summary;
+        LOG_INFO("Clipboard -> Mac: %s", it.summary.c_str());
+        refreshSettingsStatus();
+    }
+}
+
+void onRemoteClipboard(const ClipIn& in) {
+    if (!Settings::instance().get()->clipboardSync) return;
+    std::string summary;
+    if (Clip::write(S.main, in.kind, in.data, summary)) {
+        S.clipHash = Clip::hash(in.kind, in.data);
+        S.clipLast = "received " + summary;
+        LOG_INFO("Clipboard <- Mac: %s", summary.c_str());
+        refreshSettingsStatus();
+    } else {
+        LOG_WARN("Clipboard from the Mac (kind %u, %u bytes) could not be put on the Windows clipboard",
+                 (unsigned)in.kind, (unsigned)in.data.size());
+    }
+}
+
 LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (S.taskbarCreated && m == S.taskbarCreated) {  // Explorer restarted
         S.tray.readd();
@@ -2505,11 +3100,26 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_CREATE:
             S.main = h;
             S.tray.create(h, WM_TRAY);
-            SetTimer(h, 1, 300, nullptr);
+            SetTimer(h, kTimerTray, 300, nullptr);
+            if (!AddClipboardFormatListener(h)) LOG_WARN("AddClipboardFormatListener failed: %lu", GetLastError());
             return 0;
         case WM_TIMER:
-            if (w == 1) refreshTray();
+            if (w == kTimerTray) {
+                refreshTray();
+            } else if (w == kTimerClipboard) {
+                KillTimer(h, kTimerClipboard);
+                onLocalClipboardChanged();
+            }
             return 0;
+        case WM_CLIPBOARDUPDATE:
+            // Programs often update the clipboard several times in a row: wait until it is quiet for 150 ms.
+            SetTimer(h, kTimerClipboard, 150, nullptr);
+            return 0;
+        case WM_CLIPIN: {
+            std::unique_ptr<ClipIn> in(reinterpret_cast<ClipIn*>(l));  // always freed
+            onRemoteClipboard(*in);
+            return 0;
+        }
         case WM_TRAY:
             if (LOWORD(l) == WM_LBUTTONDBLCLK) openSettings();
             else if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU) showMenu(h);
@@ -2534,6 +3144,13 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 case ID_SETTINGS: openSettings(); break;
                 case ID_TEST: openTest(); break;
                 case ID_AUTOSTART: setAutostart(!autostartEnabled()); break;
+                case ID_CLIPBOARD: {
+                    Config c = *Settings::instance().get();
+                    c.clipboardSync = !c.clipboardSync;
+                    Settings::instance().set(c);
+                    if (S.settings) CheckDlgButton(S.settings, IDC_CLIPSYNC, c.clipboardSync ? BST_CHECKED : BST_UNCHECKED);
+                    break;
+                }
                 case ID_EXIT: DestroyWindow(h); break;
             }
             return 0;
@@ -2541,7 +3158,9 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             openSettings();
             return 0;
         case WM_DESTROY:
-            KillTimer(h, 1);
+            KillTimer(h, kTimerTray);
+            KillTimer(h, kTimerClipboard);
+            RemoveClipboardFormatListener(h);
             S.tray.remove();
             PostQuitMessage(0);
             return 0;
@@ -2560,6 +3179,7 @@ int run(HINSTANCE inst, LanguageManager& lang, KeyboardManager& kb, NetworkServe
     S.net = &net;
     S.dpi = (int)GetDpiForSystem();
     S.white = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));  // WIC: clipboard images
 
     NONCLIENTMETRICSW ncm{};
     ncm.cbSize = sizeof ncm;
@@ -2594,6 +3214,10 @@ int run(HINSTANCE inst, LanguageManager& lang, KeyboardManager& kb, NetworkServe
         if (S.test) PostMessageW(S.main, WM_TRACE, 0, (LPARAM) new TraceEvent(t));  // freed in MainProc
     });
     net.onStatus = [] { PostMessageW(S.main, WM_STATUS, 0, 0); };
+    net.onClipboard = [](uint8_t kind, std::vector<uint8_t>&& data) {
+        auto* in = new ClipIn{kind, std::move(data)};
+        if (!PostMessageW(S.main, WM_CLIPIN, 0, (LPARAM)in)) delete in;  // freed in MainProc otherwise
+    };
     Settings::instance().onChanged = [] { applyConfig(); };
 
     applyConfig();
@@ -2608,8 +3232,11 @@ int run(HINSTANCE inst, LanguageManager& lang, KeyboardManager& kb, NetworkServe
     Settings::instance().onChanged = nullptr;
     kb.setTraceSink(nullptr);
     net.stop();
+    net.onClipboard = nullptr;
+    // Clipboard messages still in the (now finished) queue are not freed here: the process is exiting.
     DeleteObject(S.font);
     DeleteObject(S.bigFont);
+    if (com) CoUninitialize();
     return (int)msg.wParam;
 }
 
