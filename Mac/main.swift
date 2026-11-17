@@ -40,6 +40,71 @@ let clipKindPNG: UInt8 = 2
 let clipFlagOn: UInt8 = 0x01
 let clipFlagImages: UInt8 = 0x02
 let clipMaxBytes = 20 * 1024 * 1024
+<<<<<<< HEAD
+=======
+
+/// What the Windows side can send us after the handshake.
+enum PeerMessage: Equatable {
+    case clipboard(kind: UInt8, data: Data)
+    case clipboardState(enabled: Bool, images: Bool)
+}
+
+func clipboardPacket(kind: UInt8, payload: Data) -> [UInt8] {
+    let n = UInt32(payload.count)
+    var b: [UInt8] = [pktClipboard, kind, UInt8(n & 0xFF), UInt8((n >> 8) & 0xFF), UInt8((n >> 16) & 0xFF), UInt8(n >> 24)]
+    b.append(contentsOf: payload)
+    return b
+}
+
+/// Splits the byte stream coming from Windows into messages (pure logic - covered by --selftest).
+struct PeerFrameParser {
+    enum Failure: Error, Equatable {
+        case unknownType(UInt8)
+        case tooLarge(Int)
+    }
+
+    let maxPayload: Int
+    private var buf: [UInt8] = []
+    private var pos = 0
+
+    init(maxPayload: Int = clipMaxBytes) { self.maxPayload = maxPayload }
+
+    mutating func feed(_ bytes: [UInt8]) throws -> [PeerMessage] {
+        buf.append(contentsOf: bytes)
+        var out: [PeerMessage] = []
+        while pos < buf.count {
+            let avail = buf.count - pos
+            let type = buf[pos]
+            if type == pktClipState {
+                guard avail >= 2 else { break }
+                let f = buf[pos + 1]
+                out.append(.clipboardState(enabled: f & clipFlagOn != 0, images: f & clipFlagImages != 0))
+                pos += 2
+            } else if type == pktClipboard {
+                guard avail >= 6 else { break }
+                let len = Int(buf[pos + 2]) | Int(buf[pos + 3]) << 8 | Int(buf[pos + 4]) << 16 | Int(buf[pos + 5]) << 24
+                if len > maxPayload { throw Failure.tooLarge(len) }
+                guard avail >= 6 + len else {
+                    buf.reserveCapacity(pos + 6 + len)
+                    break
+                }
+                out.append(.clipboard(kind: buf[pos + 1], data: Data(buf[(pos + 6)..<(pos + 6 + len)])))
+                pos += 6 + len
+            } else if type == pktPing {
+                guard avail >= 4 else { break }
+                pos += 4
+            } else {
+                throw Failure.unknownType(type)
+            }
+        }
+        if pos > 0 && (pos == buf.count || pos >= 65536) {  // drop what has been consumed
+            buf.removeFirst(pos)
+            pos = 0
+        }
+        return out
+    }
+}
+>>>>>>> feature/gui
 
 <<<<<<< HEAD
 =======
@@ -1004,11 +1069,17 @@ final class Forwarder {
     private var warnedSecureInput = false
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+>>>>>>> feature/gui
     /// When input was last sent to the PC (systemUptime, main thread) - drives the activity lights in the window.
     private(set) var lastKeyActivity = 0.0
     private(set) var lastPointerActivity = 0.0
 
+<<<<<<< HEAD
+>>>>>>> feature/gui
+=======
 >>>>>>> feature/gui
     init(link: Link) { self.link = link }
 
@@ -1371,6 +1442,10 @@ final class Forwarder {
             }
             let down = (type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown)
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+            lastPointerActivity = ProcessInfo.processInfo.systemUptime
+>>>>>>> feature/gui
 =======
             lastPointerActivity = ProcessInfo.processInfo.systemUptime
 >>>>>>> feature/gui
@@ -1584,6 +1659,35 @@ func runSelfTests() -> Int32 {
     h.reset()
     check("reset forgets everything", !h.modifiersHeld && h.keyUp(0) == false && h.buttonUp(1) == false)
 
+    // 13: clipboard frames (protocol 3).
+    let text = Data("Привет, Windows!\nline 2".utf8)
+    let pkt = clipboardPacket(kind: clipKindText, payload: text)
+    check("clipboard packet header is 6 bytes", pkt.count == 6 + text.count && pkt[0] == pktClipboard && pkt[1] == clipKindText)
+    var fp = PeerFrameParser()
+    let whole = (try? fp.feed(pkt)) ?? []
+    check("clipboard text round-trips", whole == [.clipboard(kind: clipKindText, data: text)])
+    fp = PeerFrameParser()
+    var pieces: [PeerMessage] = []
+    for i in stride(from: 0, to: pkt.count, by: 3) {  // arrives in tiny pieces
+        pieces += (try? fp.feed(Array(pkt[i..<min(i + 3, pkt.count)]))) ?? []
+    }
+    check("clipboard text split over many reads", pieces == [.clipboard(kind: clipKindText, data: text)])
+    fp = PeerFrameParser()
+    let two = (try? fp.feed([pktClipState, clipFlagOn | clipFlagImages, pktPing, 0, 0, 0, pktClipState, 0])) ?? []
+    check("state + ping + state in one read",
+          two == [.clipboardState(enabled: true, images: true), .clipboardState(enabled: false, images: false)])
+    fp = PeerFrameParser(maxPayload: 10)
+    var tooBig = false
+    do { _ = try fp.feed(clipboardPacket(kind: clipKindPNG, payload: Data(count: 11))) } catch { tooBig = true }
+    check("oversized clipboard is rejected", tooBig)
+    fp = PeerFrameParser()
+    var unknown = false
+    do { _ = try fp.feed([0x7F]) } catch { unknown = true }
+    check("unknown packet type is rejected", unknown)
+    fp = PeerFrameParser()
+    let empty = (try? fp.feed(clipboardPacket(kind: clipKindText, payload: Data()))) ?? []
+    check("empty clipboard payload is accepted", empty == [.clipboard(kind: clipKindText, data: Data())])
+
     print(failed == 0 ? "\nAll self-tests passed." : "\n\(failed) self-test(s) FAILED.")
     return failed == 0 ? 0 : 1
 }
@@ -1639,6 +1743,7 @@ func runDiagnose() -> Int32 {
     return 0
 }
 
+<<<<<<< HEAD
 // MARK: - UI helpers
 =======
 >>>>>>> feature/gui
@@ -1851,6 +1956,8 @@ func runDiagnose() -> Int32 {
     return 0
 }
 
+=======
+>>>>>>> feature/gui
 // MARK: - App controller (window, menu bar item, hotkey recording, permissions)
 //
 // The window itself is SwiftUI (UI.swift, `AppModel` + views). This class owns the AppKit side: lifecycle, menus,
@@ -1863,6 +1970,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var menuToggleItem: NSMenuItem!
     var menuClipItem: NSMenuItem!
 
+<<<<<<< HEAD
 <<<<<<< HEAD
     var hostField: NSTextField!
     var portField: NSTextField!
@@ -1894,6 +2002,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 =======
     let model = AppModel()
 >>>>>>> feature/gui
+=======
+    let model = AppModel()
+>>>>>>> feature/gui
     let carbonHotkey = CarbonHotkey()
     var recordMonitor: Any?
     var timer: Timer?
@@ -1904,10 +2015,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A previous instance that was killed while forwarding may have left the cursor detached: re-attach it.
         CGAssociateMouseAndMouseCursorPosition(1)
 <<<<<<< HEAD
+<<<<<<< HEAD
         buildMenu()
         buildWindow()
         buildStatusItem()
         gLogSink = { [weak self] line in self?.appendLog(line) }
+=======
+        gLogSink = { [weak self] line in self?.model.appendLog(line) }
+>>>>>>> feature/gui
 =======
         gLogSink = { [weak self] line in self?.model.appendLog(line) }
 >>>>>>> feature/gui
@@ -1918,9 +2033,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let p = cli.port { prefs.port = p }
         if let s = cli.secret { prefs.secret = s }
 <<<<<<< HEAD
+<<<<<<< HEAD
         loadControlsFromPrefs()
         applyMouseOptions()
 =======
+=======
+>>>>>>> feature/gui
         model.reloadConnectionFields()
 
         buildMenu()
@@ -1928,6 +2046,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildStatusItem()
 
         model.applyOptions()
+<<<<<<< HEAD
+>>>>>>> feature/gui
+=======
 >>>>>>> feature/gui
         gFwd.hotkey = prefs.hotkey
         carbonHotkey.register(gFwd.hotkey)
@@ -1936,8 +2057,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Immediately, on the link thread: losing the connection must never leave the Mac captured.
             if st != .connected { gFwd.stop(reason: "connection to Windows lost") }
 <<<<<<< HEAD
+<<<<<<< HEAD
             DispatchQueue.main.async { self?.refreshUI() }
 =======
+=======
+>>>>>>> feature/gui
             gClip.linkStateChanged(st)
             DispatchQueue.main.async { self?.refreshUI() }
         }
@@ -1946,6 +2070,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         gClip.onUpdate = { [weak self] in self?.refreshUI() }
         gClip.onTransfer = { [weak self] t in self?.model.clipboardTransferred(t) }
         gClip.start()
+<<<<<<< HEAD
 
         // Release the mouse whenever the Mac goes away from the user: sleep, screen sleep, fast user switching.
         let wsCenter = NSWorkspace.shared.notificationCenter
@@ -1956,6 +2081,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
 >>>>>>> feature/gui
         }
+=======
+>>>>>>> feature/gui
 
         // Release the mouse whenever the Mac goes away from the user: sleep, screen sleep, fast user switching.
         let wsCenter = NSWorkspace.shared.notificationCenter
@@ -2068,6 +2195,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func buildWindow() {
 <<<<<<< HEAD
+<<<<<<< HEAD
         let W: CGFloat = 468
 
         hostField = NSTextField(frame: .zero)
@@ -2169,10 +2297,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 640),
                           styleMask: [.titled, .closable, .miniaturizable],
 =======
+=======
+>>>>>>> feature/gui
         var height: CGFloat = 820
         if let screen = NSScreen.main { height = min(height, screen.visibleFrame.height - 60) }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: height),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
+<<<<<<< HEAD
+>>>>>>> feature/gui
+=======
 >>>>>>> feature/gui
                           backing: .buffered, defer: false)
         window.title = "MacKeyBridge"
@@ -2181,6 +2314,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentMinSize = NSSize(width: 560, height: 480)
         window.contentView = makeMainContentView(model: model)
         window.center()
+<<<<<<< HEAD
 <<<<<<< HEAD
     }
 
@@ -2226,10 +2360,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 =======
         window.setFrameAutosaveName("MacKeyBridgeMainWindow")
 >>>>>>> feature/gui
+=======
+        window.setFrameAutosaveName("MacKeyBridgeMainWindow")
+>>>>>>> feature/gui
     }
 
     // MARK: actions
 
+<<<<<<< HEAD
 <<<<<<< HEAD
     @objc func connectClicked() {
         if gLink.isWanted {
@@ -2316,10 +2454,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: permissions
+=======
+    @objc func forwardClicked() { gFwd.toggle() }
+>>>>>>> feature/gui
+
+    @objc func clipboardMenuClicked() { model.clipboardSync.toggle() }
 
     // MARK: hotkey recording
 
-    @objc func changeHotkeyClicked() {
+    func changeHotkey() {
         if recordMonitor != nil {
             stopRecording()
             return
@@ -2330,7 +2473,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         gFwd.recordingHotkey = true  // no hotkey fires while we listen for the new one
         carbonHotkey.unregister()    // otherwise the old combination would be consumed before our window sees it
-        hotkeyButton.title = "Press keys... (Esc = cancel)"
+        model.recordingHotkey = true
         recordMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] ev in
             self?.recorded(ev)
             return nil  // swallow it, no beep
@@ -2371,7 +2514,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordMonitor = nil
         gFwd.recordingHotkey = false
         carbonHotkey.register(gFwd.hotkey)
-        hotkeyButton.title = "Change..."
+        model.recordingHotkey = false
         refreshUI()
     }
 
@@ -2382,11 +2525,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         say("Emergency hotkey is now \(hk.display)")
     }
 
-    @objc func resetHotkeyClicked() {
+    func resetHotkey() {
         if recordMonitor != nil { stopRecording() }
         setHotkey(Hotkey())
         refreshUI()
     }
+
+    // MARK: permissions
 
     func openPane(_ anchor: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
@@ -2409,6 +2554,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let st = gLink.currentState
         let fwd = gFwd.forwarding
+<<<<<<< HEAD
         let hk = gFwd.hotkey.display
         if let b = statusItem.button {
             let symbol = fwd ? "keyboard.fill" : "keyboard"
@@ -2430,17 +2576,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 <<<<<<< HEAD
         connectButton.title = gLink.isWanted ? "Disconnect" : "Connect"
 
+=======
+>>>>>>> feature/gui
         let hk = gFwd.hotkey.display
-        let ready = gFwd.ready  // tap installed AND Accessibility AND Input Monitoring granted
-        forwardButton.isEnabled = (st == .connected) && ready
-        forwardButton.title = fwd ? "Stop forwarding  (\(hk))" : "Start forwarding  (\(hk))"
-        if !ready {
-            forwardHint.stringValue = "Grant Accessibility and Input Monitoring below (both are required). Forwarding becomes available automatically."
-        } else if fwd {
-            forwardHint.stringValue = "The Mac keyboard and trackpad now control the Windows PC. Press \(hk) to get them back on this Mac (clicking here will not work while the trackpad is forwarded)."
-        } else {
-            forwardHint.stringValue = "Press \(hk) from any app to start or stop forwarding."
+        if let b = statusItem.button {
+            let symbol = fwd ? "keyboard.fill" : "keyboard"
+            let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "MacKeyBridge")
+                ?? NSImage(systemSymbolName: "keyboard", accessibilityDescription: "MacKeyBridge")
+            img?.isTemplate = true
+            b.image = img
+            b.imagePosition = .imageLeading
+            b.title = fwd ? " → PC" : (img == nil ? "⌨" : "")
+            b.appearsDisabled = st != .connected
+            b.toolTip = fwd ? "MacKeyBridge: forwarding to Windows (\(hk) to stop)"
+                : (st == .connected ? "MacKeyBridge: connected" : "MacKeyBridge: not connected")
         }
+<<<<<<< HEAD
         hotkeyLabel.stringValue = hk
         hotkeyButton.isEnabled = !fwd
         hotkeyResetButton.isEnabled = !fwd
@@ -2471,6 +2622,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menuToggleItem.title = fwd ? "Stop forwarding (\(hk))" : "Start forwarding (\(hk))"
         menuToggleItem.isEnabled = forwardButton.isEnabled
 =======
+        menuToggleItem.title = fwd ? "Stop Forwarding  (\(hk))" : "Start Forwarding  (\(hk))"
+        menuToggleItem.isEnabled = fwd || (st == .connected && gFwd.ready)
+        menuClipItem.state = model.clipboardSync ? .on : .off
+>>>>>>> feature/gui
+=======
+        switch st {
+        case .connected: menuStateItem.title = fwd ? "Forwarding to Windows" : "Connected to Windows"
+        case .connecting: menuStateItem.title = "Connecting…"
+        default: menuStateItem.title = "Not connected"
+        }
         menuToggleItem.title = fwd ? "Stop Forwarding  (\(hk))" : "Start Forwarding  (\(hk))"
         menuToggleItem.isEnabled = fwd || (st == .connected && gFwd.ready)
         menuClipItem.state = model.clipboardSync ? .on : .off

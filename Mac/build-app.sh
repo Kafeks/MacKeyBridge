@@ -1,9 +1,15 @@
 #!/bin/bash
+<<<<<<< HEAD
 # Build MacKeyBridge.app outside the source directory (and never inside Trash).
 # Usage: chmod +x build-app.sh && ./build-app.sh
 # Optional: BUILD_DIR="$HOME/Applications" SIGN_IDENTITY="MacKeyBridge Dev" ./build-app.sh
 
 set -Eeuo pipefail
+=======
+# Builds MacKeyBridge.app from main.swift, Clipboard.swift and UI.swift (needs the Xcode command line tools: xcode-select --install).
+# Usage:  chmod +x build-app.sh && ./build-app.sh
+set -e
+>>>>>>> feature/gui
 cd "$(dirname "$0")"
 
 APP_NAME="MacKeyBridge.app"
@@ -11,12 +17,16 @@ BUILD_DIR="${BUILD_DIR:-$HOME/Applications}"
 mkdir -p "$BUILD_DIR"
 BUILD_DIR="$(cd "$BUILD_DIR" && pwd -P)"
 
+<<<<<<< HEAD
 case "$BUILD_DIR" in
   "$HOME/.Trash"|"$HOME/.Trash/"*|*/.Trash|*/.Trash/*|*/Trash|*/Trash/*)
     echo "ERROR: Build directory is inside Trash: $BUILD_DIR" >&2
     exit 1
     ;;
 esac
+=======
+swiftc -O main.swift Clipboard.swift UI.swift -o "$APP/Contents/MacOS/MacKeyBridge"
+>>>>>>> feature/gui
 
 FINAL_APP="$BUILD_DIR/$APP_NAME"
 STAGING_DIR="$(mktemp -d "$BUILD_DIR/.MacKeyBridge-build.XXXXXX")"
@@ -42,8 +52,13 @@ cat > "$STAGED_APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key><string>MacKeyBridge</string>
     <key>CFBundlePackageType</key><string>APPL</string>
 <<<<<<< HEAD
+<<<<<<< HEAD
     <key>CFBundleShortVersionString</key><string>2.1</string>
     <key>CFBundleVersion</key><string>3</string>
+=======
+    <key>CFBundleShortVersionString</key><string>3.0</string>
+    <key>CFBundleVersion</key><string>4</string>
+>>>>>>> feature/gui
 =======
     <key>CFBundleShortVersionString</key><string>3.0</string>
     <key>CFBundleVersion</key><string>4</string>

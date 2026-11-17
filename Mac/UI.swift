@@ -1148,12 +1148,17 @@ struct LogCard: View {
                     .frame(height: 170)
                     .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.well))
                     .onAppear { if let last = model.log.last { proxy.scrollTo(last.id, anchor: .bottom) } }
+<<<<<<< HEAD
                     .onChange(of: model.log.last?.id) { _, newID in
                         if let id = newID {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 proxy.scrollTo(id, anchor: .bottom)
                             }
                         }
+=======
+                    .onChange(of: model.log.last?.id) { id in
+                        if let id = id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .bottom) } }
+>>>>>>> feature/gui
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
