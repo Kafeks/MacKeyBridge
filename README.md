@@ -1,33 +1,30 @@
 # MacKeyBridge
 
-Use a MacBook's **built-in keyboard and trackpad** to control a **Windows PC** over Wi-Fi/LAN. The **Fn** key switches the Windows keyboard layout (e.g. English <-> Russian), and Mac shortcuts such as `Cmd+C` become `Ctrl+C`.
+Use a MacBook's **built-in keyboard and trackpad** to control a **Windows PC** over Wi-Fi/LAN, and share **one clipboard** between both computers. The **Fn** key switches the Windows keyboard layout (e.g. English <-> Russian), and Mac shortcuts such as `Cmd+C` become `Ctrl+C`.
 
-Two small programs, one file each:
+Two small programs:
 
-| Part | File | Language |
+| Part | Files | Language |
 |---|---|---|
-| Windows server (tray app) | [`windows/MacKeyBridge.cpp`](windows/MacKeyBridge.cpp) | C++20, Win32 API only |
-| macOS client (window + menu bar item) | [`mac/main.swift`](mac/main.swift) (+ optional [`mac/build-app.sh`](mac/build-app.sh)) | Swift, AppKit |
+| Windows server (tray app) | [`Windows/MacKeyBridge.cpp`](Windows/MacKeyBridge.cpp) | C++20, Win32 API only (+ WIC for clipboard images) |
+| macOS client (window + menu bar item) | [`Mac/main.swift`](Mac/main.swift) (engine), [`Mac/Clipboard.swift`](Mac/Clipboard.swift) (clipboard sync), [`Mac/UI.swift`](Mac/UI.swift) (SwiftUI window), [`Mac/build-app.sh`](Mac/build-app.sh) | Swift, AppKit + SwiftUI |
 
 ```
-MacBook keyboard --> macOS client --(TCP, Wi-Fi/LAN)--> MacKeyBridge.exe --> SendInput --> any Windows app
+MacBook keyboard/trackpad --> macOS client --(TCP, Wi-Fi/LAN)--> MacKeyBridge.exe --> SendInput --> any Windows app
+Mac clipboard            <--------------- clipboard sync (both ways) --------------->  Windows clipboard
 ```
 
-> **Status:** keyboard forwarding and the Fn layout switch work on the author's MacBook + Windows PC. Trackpad forwarding and the Mac window (protocol 2) are new and may need tuning (pointer/scroll speed and direction). It is a hobby project and not widely tested; issues and pull requests are welcome.
+> **Status:** keyboard forwarding and the Fn layout switch work on the author's MacBook + Windows PC. Trackpad forwarding, the SwiftUI window and clipboard sync (protocol 3) are newer and may need tuning. It is a hobby project and not widely tested; issues and pull requests are welcome.
 
 ## Features
 
 - Persistent TCP connection, a few bytes per event, auto-reconnect.
-<<<<<<< HEAD
-- **Trackpad / mouse:** pointer movement, tap and click (left, right, middle), drag, two-finger scroll (vertical + horizontal), with pointer speed, scroll speed and scroll-direction settings.
-- **Mac client with a GUI:** connect/disconnect, status, start/stop forwarding, sliders and checkboxes for the trackpad, permission status with shortcuts to the right System Settings panes, log, remembers its settings.
-=======
+- **Two-way clipboard sync:** copy text or an image on one computer, paste it on the other. See [Clipboard sync](#clipboard-sync).
+- **Native Mac window** (SwiftUI, light and dark mode): live Mac ⇄ Windows connection view, activity lights for keyboard, trackpad and clipboard, settings grouped by topic. See [The Mac window](#the-mac-window).
 - **Mouse forwarding with real capture:** while forwarding is on, the Mac cursor is detached and hidden, clicks and scrolling no longer reach macOS, and everything goes to the PC. See [Mouse forwarding](#mouse-forwarding-how-it-works).
 - **Emergency hotkey** (default `Control+Option+Command+W`, changeable) that works from any app, with three independent detection paths. See [Emergency hotkey](#emergency-hotkey).
 - **Swipe navigation:** two fingers left -> right = previous slide/page, right -> left = next, sent as arrow keys, Page Up / Page Down, or the **mouse side buttons** (Back / Forward). See [Swipe navigation](#swipe-navigation-slides-and-pages).
 - Pointer movement, tap and click (left, right, middle), drag, two-finger scroll (vertical + horizontal) with pointer speed, scroll speed and scroll-direction settings.
-- **Mac client with a GUI:** connect/disconnect, status, start/stop forwarding, hotkey recorder, swipe settings, permission status with shortcuts to the right System Settings panes, log; remembers its settings.
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 - Keys are injected by scan code, so the active Windows layout decides the character (works in browsers, VS Code, Discord, terminals, most games).
 - **Fn tap = switch layout.** Layouts cycle in the order configured in the settings (ENG -> RUS -> ENG, more can be added).
 - **Mac Mode:** Left Command acts as Ctrl, Right Command acts as the Windows key, plus Mac-style shortcuts and text navigation.
@@ -46,7 +43,7 @@ MacBook keyboard --> macOS client --(TCP, Wi-Fi/LAN)--> MacKeyBridge.exe --> Sen
 
 ### 1. Windows (server)
 
-Open the **x64 Native Tools Command Prompt for VS 2022** in the `windows` folder:
+Open the **x64 Native Tools Command Prompt for VS 2022** in the `Windows` folder:
 
 ```bat
 cl /std:c++20 /O2 /EHsc /utf-8 MacKeyBridge.cpp
@@ -55,7 +52,7 @@ cl /std:c++20 /O2 /EHsc /utf-8 MacKeyBridge.cpp
 MinGW-w64 alternative:
 
 ```bat
-g++ -std=c++20 -O2 -static -mwindows MacKeyBridge.cpp -o MacKeyBridge.exe -lws2_32 -lbcrypt -lgdi32 -lcomctl32 -lshell32 -ladvapi32 -luser32
+g++ -std=c++20 -O2 -static -mwindows MacKeyBridge.cpp -o MacKeyBridge.exe -lws2_32 -lbcrypt -lgdi32 -lcomctl32 -lshell32 -ladvapi32 -luser32 -lole32
 ```
 
 Run `MacKeyBridge.exe`. The settings window shows the **port** (47800), the **secret** and a ready-to-copy command for the Mac. A tray icon appears.
@@ -69,16 +66,16 @@ netsh advfirewall firewall add rule name="MacKeyBridge" dir=in action=allow prot
 ### 2. macOS (client)
 
 ```bash
-cd mac
-swiftc -O main.swift -o MacKeyBridge && ./MacKeyBridge
+cd Mac
+swiftc -O main.swift Clipboard.swift UI.swift -o MacKeyBridge && ./MacKeyBridge
 ```
 
-A window opens. Enter the PC's **address** (its IPv4 address in your home network, `ipconfig` on the PC, e.g. `192.168.x.x` - not a VPN address), the **port** (47800) and the **secret** from the Windows settings, then click **Connect**. The settings are remembered.
+A window opens. In the **Connection** section enter the PC's **IP address** (its IPv4 address in your home network, `ipconfig` on the PC, e.g. `192.168.x.x` - not a VPN address), the **port** (47800) and the **secret** from the Windows settings, then click **Connect**. The settings are remembered.
 
 Run from the Terminal like this, macOS attaches the privacy permissions to the Terminal app. For a standalone app with its own permissions build the bundle instead:
 
 ```bash
-cd mac
+cd Mac
 chmod +x build-app.sh
 ./build-app.sh        # creates and opens MacKeyBridge.app
 ```
@@ -91,18 +88,49 @@ Optional command line (prefills the window and connects at once): `./MacKeyBridg
 
 ### 3. Use it
 
-<<<<<<< HEAD
-- `Control + Option + Command + W` (or the button in the window / the menu bar item) toggles forwarding: the keyboard **and trackpad** control Windows (`⌨ → PC`) or are back on the Mac.
-- While forwarding is on, the Mac cursor stays still and clicks do nothing on the Mac. **The hotkey is the way back**, it always works.
-- Tap **Fn** to switch the Windows layout.
-- Trackpad: move = pointer, tap or click = left click, two-finger click/tap = right click, two-finger swipe = scroll. Tap-to-click must be enabled in the Mac's trackpad settings if you want taps.
-=======
 1. Connect (status turns green).
 2. Press the hotkey (default **`Control+Option+Command+W`**) from any app, or click **Start forwarding** in the window or menu bar item. The menu bar shows `⌨ → PC`.
 3. The keyboard and trackpad now control Windows; the Mac cursor stays frozen and Mac apps get no input.
 4. Press the hotkey again to get everything back on the Mac. **The hotkey is the way back** - clicking the window does not work while the trackpad is captured.
 
 Tap **Fn** to switch the Windows layout. Trackpad: move = pointer, tap or click = left click, two-finger click/tap = right click, two-finger vertical swipe = scroll, two-finger horizontal swipe = previous/next slide. Tap-to-click must be enabled in the Mac's trackpad settings if you want taps.
+
+## The Mac window
+
+The window is written in SwiftUI (macOS 12+), follows the system light / dark appearance and the accent colour, and stays in the menu bar when closed. From top to bottom:
+
+| Section | What it shows / does |
+|---|---|
+| **Header** | *This Mac* and *Windows PC* with the link between them: grey dashes = not connected, moving orange dots = connecting, solid green = connected, a stream flowing towards the PC = forwarding. Below: the status in words, three **activity lights** (Keyboard, Trackpad, Clipboard) that light up while input or clipboard data is actually sent, and the big **Start / Stop Forwarding** button. |
+| **Connection** | Windows IP, port, secret (with a show/hide eye), status with the exact error, **Connect / Disconnect**, connect automatically at launch. Return in a field connects. The fields are locked while connected. |
+| **Keyboard** | The emergency hotkey shown as key caps, **Change…** (record a new one, `Esc` cancels) and **Reset**; short reminders of the Fn and Command mapping. |
+| **Trackpad** | Switch to forward the trackpad at all, pointer and scroll speed, invert scrolling, and the swipe navigation options (distance, what a swipe sends, reverse). |
+| **Clipboard** | Switch for clipboard sync, *Include images*, the state of the Windows side (ready / off there / app too old) and the last transfer with direction, size and time. |
+| **Permissions** | Accessibility, Input Monitoring, Local Network with a green / red mark and **Open Settings…**. |
+| **Activity Log** | Collapsible log with copy and clear buttons. |
+
+The menu bar item shows a keyboard symbol (dimmed when not connected, `→ PC` while forwarding) and has *Start/Stop Forwarding*, *Sync Clipboard*, *Open MacKeyBridge…* and *Quit*.
+
+## Clipboard sync
+
+Copy on one computer, paste on the other - both directions, no extra step. It needs protocol 3 on both sides (this version of `MacKeyBridge.exe` **and** of the Mac app) and is on by default; it works whether forwarding is on or off, as long as the Mac is connected.
+
+| | Mac | Windows |
+|---|---|---|
+| Switch | *Clipboard* section (and the menu bar item) | *Settings -> Connection -> Sync the clipboard with the Mac* (and the tray menu) |
+| Text | any plain text (`public.utf8-plain-text`) | `CF_UNICODETEXT`; line ends are converted (LF on the Mac, CRLF on Windows) |
+| Images | PNG, or TIFF converted to PNG; written as PNG + TIFF | the registered `PNG` format, or any bitmap (`CF_DIB`/`CF_BITMAP`) converted to PNG with WIC; written as `PNG` + `CF_DIB` |
+| Not synced | files (Finder copies), anything marked `org.nspasteboard.ConcealedType` / `TransientType` / `AutoGeneratedType` (password managers) | files (`CF_HDROP`), anything marked `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`, or `CanIncludeInClipboardHistory = 0` |
+
+How it works:
+
+- Each side announces whether it takes part (`CLIP_STATE`) when the connection starts and whenever the switch changes. Contents are sent only while **both** sides have it on, so switching it off on either side stops the flow in both directions. With *Include images* off on the Mac, Windows does not send images either.
+- The Mac polls the pasteboard's change counter every 0.4 s (macOS has no change notification); Windows uses `AddClipboardFormatListener` and waits until the clipboard has been quiet for 150 ms (programs often write it several times in a row).
+- No ping-pong: what one side writes is marked as its own (Mac: the change counter; Windows: a private `MacKeyBridge.FromMac` format) and is never sent back, and content identical to the last one sent or received is skipped.
+- Size limit: 20 MB per item; larger items are skipped with a log line. When the text and an image are both on the clipboard (e.g. copied spreadsheet cells), the text wins.
+- Large images are sent over the same connection as the input events, so key presses typed during a multi-megabyte transfer arrive after it (a few hundred ms on a normal Wi-Fi).
+
+With an older `MacKeyBridge.exe` (protocol 2) the Mac app connects with protocol 2 automatically: keyboard and trackpad work, the clipboard section says *Update MacKeyBridge.exe*. An older Mac app still connects to the new `MacKeyBridge.exe` the same way.
 
 ## Mouse forwarding: how it works
 
@@ -228,7 +256,7 @@ Missing permissions never leave the mouse captured: forwarding refuses to start,
 
 | Setting | Meaning |
 |---|---|
-| Address / Port / Secret | where to connect and the shared secret from the Windows settings |
+| Windows IP / Port / Secret | where to connect and the shared secret from the Windows settings |
 | Start / Stop forwarding | same as the hotkey (also in the menu bar item) |
 | **Emergency hotkey** - Change... / Reset | record a new hotkey / restore `Control+Option+Command+W` |
 | Forward trackpad / mouse too | Off = only the keyboard is forwarded, the trackpad keeps controlling the Mac (no capture) |
@@ -239,10 +267,11 @@ Missing permissions never leave the mouse captured: forwarding refuses to start,
 | **Swipe distance** | Finger travel that triggers a swipe (30-300, default 80) |
 | **Swipe sends** | `Left / Right arrow`, `Page Up / Page Down` or `Mouse side buttons (Back / Forward)` |
 | **Reverse swipe direction** | Swap previous / next |
-| Connect automatically when the app starts | Auto-connect with the saved settings |
+| **Clipboard sync** | Two-way clipboard sync with Windows (default on) |
+| **Include images** | Also sync images (default on); off = text only, in both directions |
+| Connect automatically when MacKeyBridge opens | Auto-connect with the saved settings |
 
-Settings are saved in the app's preferences (`UserDefaults`; with the bundle: `defaults read local.mackeybridge.client`). Keys: `host`, `port`, `secret`, `forwardMouse`, `pointerSpeed`, `scrollSpeed`, `invertV`, `invertH`, `autoConnect`, `swipeNav`, `swipeThreshold`, `swipeKeys` (0 arrows, 1 Page keys, 2 side buttons), `swipeReverse`, `hotkeyCode`, `hotkeyFlags`, `hotkeyName`.
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
+Settings are saved in the app's preferences (`UserDefaults`; with the bundle: `defaults read local.mackeybridge.client`). Keys: `host`, `port`, `secret`, `forwardMouse`, `pointerSpeed`, `scrollSpeed`, `invertV`, `invertH`, `autoConnect`, `swipeNav`, `swipeThreshold`, `swipeKeys` (0 arrows, 1 Page keys, 2 side buttons), `swipeReverse`, `hotkeyCode`, `hotkeyFlags`, `hotkeyName`, `clipboardSync`, `clipboardImages`.
 
 ## Key mapping (Mac Mode, default)
 
@@ -262,17 +291,6 @@ Settings are saved in the app's preferences (`UserDefaults`; with the bundle: `d
 | `Cmd+Left/Right/Up/Down` | `Home` / `End` / `Ctrl+Home` / `Ctrl+End` |
 | `Option+Left/Right/Backspace` | `Ctrl+Left` / `Ctrl+Right` / `Ctrl+Backspace` |
 | Volume, Play/Pause, Next/Previous | Windows media keys |
-
-## Trackpad settings (in the Mac window)
-
-| Setting | Meaning |
-|---|---|
-| Forward trackpad / mouse too | Off = only the keyboard is forwarded, the trackpad keeps controlling the Mac |
-| Pointer speed | Multiplier for pointer movement (Windows applies its own acceleration on top; disable *Enhance pointer precision* in Windows mouse settings if the pointer feels odd) |
-| Scroll speed | Multiplier for scrolling |
-| Invert vertical / horizontal scroll | Flip the direction if scrolling feels backwards on Windows |
-
-Swipes with three or four fingers (Mission Control, desktops) are handled by macOS itself and are not forwarded.
 
 Every keyboard group can be turned off in **Settings -> Keyboard** on Windows. With Mac Mode off, Command is simply the Windows key.
 
@@ -302,8 +320,6 @@ languages=0x0409,0x0419        ; English (US), Russian
 
 Add language IDs (for example `0x0443` Uzbek Latin, `0x0407` German) to cycle through more layouts. The layouts must be installed in Windows.
 
-<<<<<<< HEAD
-=======
 ## Testing
 
 **Automatic (no permissions needed):**
@@ -312,7 +328,7 @@ Add language IDs (for example `0x0443` Uzbek Latin, `0x0407` German) to cycle th
 ./MacKeyBridge.app/Contents/MacOS/MacKeyBridge --selftest
 ```
 
-It checks the swipe recognizer (both directions, vertical scroll, small movements, one swipe per gesture, inertia, cooldown, thresholds), hotkey matching and the stuck-key bookkeeping, and prints `PASS`/`FAIL` per case.
+It checks the swipe recognizer (both directions, vertical scroll, small movements, one swipe per gesture, inertia, cooldown, thresholds), hotkey matching, the stuck-key bookkeeping and the clipboard frame parser (split reads, several messages per read, size limit, unknown types), and prints `PASS`/`FAIL` per case.
 
 **Manual checklist (needs the Mac, the PC and the permissions):**
 
@@ -331,8 +347,12 @@ It checks the swipe recognizer (both directions, vertical scroll, small movement
 13. Disconnect the Wi-Fi while forwarding: press the hotkey (immediate), and check that forwarding also stops by itself once the client notices the lost connection.
 14. Revoke Input Monitoring while forwarding: forwarding stops and the mouse is released.
 15. Set *Swipe sends* to *Mouse side buttons* and swipe in a browser on the PC: left -> right goes Back, right -> left goes Forward.
+16. Copy text on the Mac, paste on Windows (Notepad): same text, line breaks intact. Copy text on Windows, paste on the Mac.
+17. `Cmd+Shift+Ctrl+4` (screenshot to the clipboard) on the Mac, paste into Paint on Windows; `Win+Shift+S` on Windows, paste into Preview (*File -> New from Clipboard*) on the Mac.
+18. Copy a password in a password manager: nothing is sent (log line).
+19. Switch clipboard sync off on one side: the other side shows it, and nothing is transferred in either direction.
+20. Switch between light and dark mode while the window is open: all sections stay readable.
 
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 ## Troubleshooting
 
 | Problem | Fix |
@@ -341,11 +361,10 @@ It checks the swipe recognizer (both directions, vertical scroll, small movement
 | `nc` says `timed out` / `No route to host` | Add the firewall rule above (or set the Windows network to Private); allow **Local Network** for your terminal in macOS; make sure both devices are on the same subnet and the Wi-Fi has no client isolation. |
 | IP starts with `26.` or `25.` | That is a VPN address (Radmin VPN / Hamachi). Use the `192.168.x.x` / `10.x.x.x` address of your home network. |
 | `Wrong secret` | Copy the secret from the Windows settings window. |
-<<<<<<< HEAD
-| `Version mismatch` | Update both `MacKeyBridge.cpp` (rebuild the exe) and `main.swift`: they must be the same version (protocol 2). |
-| Window says permissions are missing / forwarding button is disabled | Grant Accessibility and Input Monitoring (the window has buttons for it). It activates by itself; if not, restart the app. |
-=======
-| `Version mismatch` | Update both `MacKeyBridge.cpp` (rebuild the exe) and `main.swift`: they must be the same protocol version (2). |
+| `Version mismatch` | The Mac app speaks protocol 3 and falls back to 2 by itself; this message means the two are further apart. Update both `MacKeyBridge.cpp` (rebuild the exe) and the Mac app. |
+| Clipboard section says *Update MacKeyBridge.exe* | The PC runs an older exe (protocol 2): rebuild it from this `MacKeyBridge.cpp`. |
+| Clipboard section says *Off in the Windows settings* | Tick *Sync the clipboard with the Mac* in the Windows settings (Connection tab) or in the tray menu. |
+| Copied text does not arrive | The log on both sides says why (marked private by a password manager, files, over 20 MB). Images need *Include images* on the Mac. |
 | *Start forwarding* is disabled / the window says a permission is missing | Grant **both** Accessibility and Input Monitoring (see [Permissions](#permissions-macos)). It activates by itself; if not, restart the app. After a rebuild, remove and re-add the entries or use `tccutil reset` (see above). |
 | The log says `Forwarding not started: ... permission missing` | Same as above: the missing permission is named in the message. |
 | The Mac cursor still moves while forwarding | Look at the log for `Could not detach the Mac cursor` or `Cursor position changed while captured`. Run `--diagnose` to check the permissions, and make sure *Forward trackpad / mouse too* is ticked. Press the hotkey to stop. |
@@ -355,7 +374,6 @@ It checks the swipe recognizer (both directions, vertical scroll, small movement
 | Swiping does not change slides | The PC window must have focus and be in the right mode (arrow keys change slides in slide show mode; in PowerPoint's editing view try *Swipe sends = Page Up / Page Down*; *Mouse side buttons* only works in apps that react to Back / Forward buttons). Check that the swipe option is ticked and *Forward trackpad / mouse too* is on, and lower **Swipe distance** if your swipe is too short to trigger. |
 | A slide changes while scrolling vertically | Raise **Swipe distance**, and keep your fingers more vertical (a swipe needs horizontal movement of at least twice the vertical one). |
 | Horizontal scrolling no longer works on Windows | By design, horizontal two-finger movement is now navigation. Untick *Two-finger horizontal swipe = previous / next*, or hold `Shift` while scrolling. |
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 | Windows pointer moves too fast/slow or scroll is backwards | Adjust *Pointer speed*, *Scroll speed* and the invert checkboxes in the Mac window. |
 | Mac cursor stays frozen after a crash | Press `Control+Option+Command+W`, or quit and reopen MacKeyBridge. |
 | Keys type on both computers | Forwarding is off. The window button should say *Stop forwarding* and the menu bar `⌨ → PC`. |
@@ -368,7 +386,7 @@ Log file: `%APPDATA%\MacKeyBridge\log.txt` (enable *Debug mode* to log every key
 ## Security
 
 - Every connection is authenticated with an HMAC-SHA256 challenge-response using the shared secret (the secret is never sent over the network).
-- **Key presses are not encrypted.** Anyone who can sniff your network can read what you type, including passwords. Use a trusted network, or a VPN such as Tailscale and connect through its address.
+- **Key presses and clipboard contents are not encrypted.** Anyone who can sniff your network can read what you type and copy, including passwords. Use a trusted network, or a VPN such as Tailscale and connect through its address. Clipboard sync skips content that password managers mark as private, and can be switched off on either side.
 - Anyone who knows the secret and can reach the port can type on your PC. Keep the secret private and do not commit `settings.ini` to a repository.
 
 ## Limitations
@@ -376,23 +394,20 @@ Log file: `%APPDATA%\MacKeyBridge\log.txt` (enable *Debug mode* to log every key
 - Games with anti-cheat (EAC, BattlEye, Vanguard, ...) treat `SendInput` as injected input and may block it. Do not use this in such games.
 - Windows apps running as administrator ignore input from a normal process (UIPI). Run MacKeyBridge as administrator if you need that.
 - The lock screen, UAC prompts and `Ctrl+Alt+Del` cannot be controlled through `SendInput`.
-<<<<<<< HEAD
-- macOS blocks event taps while *Secure Input* is active (password fields in some apps).
-=======
 - macOS blocks event taps from seeing keystrokes while *Secure Input* is active (password fields in some apps, Secure Keyboard Entry in Terminal). The Carbon hotkey can still stop forwarding, but keys are not forwarded meanwhile.
 - Hiding the Mac cursor is best effort (macOS may ignore it when the app is not frontmost); the cursor is frozen in either case.
 - A forcibly killed process (`kill -9`) cannot clean up after itself: starting the app again re-attaches the cursor.
 - Swipe navigation sends plain arrow / Page keys or mouse side-button clicks, so it works in whatever Windows app interprets them; it cannot know whether a presentation is open. Only two-finger horizontal gestures are interpreted; three-finger gestures stay with macOS.
 - In swipe mode a vertical gesture drops its small horizontal component, and horizontal two-finger scrolling is replaced by navigation (turn the option off to get it back).
 - The swipe direction relies on macOS reporting the natural-scrolling flag correctly; use *Reverse swipe direction* if it does not.
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 - Mac keyboards/trackpads only; media keys other than volume/play/next/previous (brightness, keyboard backlight) stay on the Mac.
 - Trackpad gestures with three or more fingers and pinch/rotate are not forwarded.
 - The Mac client stores its settings, including the secret, in the app's preferences (`UserDefaults`) in plain text.
+- Clipboard sync covers text and images only (no files, no rich text formatting); one item at a time, up to 20 MB.
 
-## Protocol (version 2)
+## Protocol (version 3)
 
-After the TCP connection the server sends a 16-byte challenge; the client answers with `HMAC-SHA256(secret, nonce)` and the protocol version; the server replies `AUTH_OK` or `AUTH_FAIL` + reason (1 wrong secret, 2 version mismatch). Then the client sends events; the first byte is the type and fixes the length:
+After the TCP connection the server sends a 16-byte challenge; the client answers with `HMAC-SHA256(secret, nonce)` and the protocol version; the server replies `AUTH_OK` or `AUTH_FAIL` + reason (1 wrong secret, 2 version mismatch). The server accepts versions 2 and 3; the client offers 3 and retries with 2 when an older server answers *version mismatch*. Then the client sends events; the first byte is the type and fixes the length:
 
 ```
 0x10 KEY_DOWN     [type][flags][code lo][code hi]       4 bytes (flags bit 0 = auto-repeat)
@@ -402,10 +417,12 @@ After the TCP connection the server sends a 16-byte challenge; the client answer
 0x20 MOUSE_MOVE   [type][dx int16][dy int16]            5 bytes, relative pixels
 0x21 MOUSE_BUTTON [type][button][down]                  3 bytes, 0 left 1 right 2 middle 3 back 4 forward
 0x22 MOUSE_WHEEL  [type][dx int16][dy int16]            5 bytes, 120 = one notch, dy>0 up, dx>0 right
+
+protocol 3 only, both directions:
+0x30 CLIPBOARD    [type][kind][len uint32][payload]       6 + len bytes, kind 1 = UTF-8 text (LF), 2 = PNG; len <= 20 MiB
+0x31 CLIP_STATE   [type][flags]                          2 bytes, bit 0 = sync on, bit 1 = images accepted
 ```
 
-<<<<<<< HEAD
-Key code: macOS virtual key code, or `0x100 + NX_KEYTYPE` for media keys (Fn = 63). The client pings every second; the server releases all keys and mouse buttons if nothing arrives for 3 seconds.
-=======
+All integers are little-endian. Each side sends `CLIP_STATE` right after the handshake and whenever its setting changes, and sends `CLIPBOARD` only while the other side has announced *sync on*.
+
 Key code: macOS virtual key code, or `0x100 + NX_KEYTYPE` for media keys (Fn = 63). Swipe navigation uses ordinary packets: `123` / `124` (Left / Right arrow) or `116` / `121` (Page Up / Page Down), each as KEY_DOWN followed by KEY_UP, or MOUSE_BUTTON `3` (Back) / `4` (Forward), each as down followed by up. The client pings every second; the server releases all keys and mouse buttons if nothing arrives for 3 seconds.
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
