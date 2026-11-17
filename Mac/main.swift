@@ -15,9 +15,10 @@ func say(_ s: String) {
     DispatchQueue.main.async { gLogSink?(s) }
 }
 
-// MARK: - Protocol constants (version 2)
+// MARK: - Protocol constants (version 3; version 2 = without clipboard, still spoken with an older Windows app)
 
-let protoVersion: UInt8 = 2
+let protoVersion: UInt8 = 3
+let protoVersionLegacy: UInt8 = 2
 let pktChallenge: UInt8 = 0x01
 let pktAuth: UInt8 = 0x02
 let pktAuthOk: UInt8 = 0x03
@@ -29,6 +30,78 @@ let pktPing: UInt8 = 0x13
 let pktMouseMove: UInt8 = 0x20
 let pktMouseButton: UInt8 = 0x21
 let pktMouseWheel: UInt8 = 0x22
+// Protocol 3, both directions:
+//   0x30 CLIPBOARD  [type][kind][len u32 LE][payload]   kind 1 = UTF-8 text (LF line ends), 2 = PNG image
+//   0x31 CLIP_STATE [type][flags]                       bit 0 = clipboard sync on, bit 1 = images accepted
+let pktClipboard: UInt8 = 0x30
+let pktClipState: UInt8 = 0x31
+let clipKindText: UInt8 = 1
+let clipKindPNG: UInt8 = 2
+let clipFlagOn: UInt8 = 0x01
+let clipFlagImages: UInt8 = 0x02
+let clipMaxBytes = 20 * 1024 * 1024
+
+/// What the Windows side can send us after the handshake.
+enum PeerMessage: Equatable {
+    case clipboard(kind: UInt8, data: Data)
+    case clipboardState(enabled: Bool, images: Bool)
+}
+
+func clipboardPacket(kind: UInt8, payload: Data) -> [UInt8] {
+    let n = UInt32(payload.count)
+    var b: [UInt8] = [pktClipboard, kind, UInt8(n & 0xFF), UInt8((n >> 8) & 0xFF), UInt8((n >> 16) & 0xFF), UInt8(n >> 24)]
+    b.append(contentsOf: payload)
+    return b
+}
+
+/// Splits the byte stream coming from Windows into messages (pure logic - covered by --selftest).
+struct PeerFrameParser {
+    enum Failure: Error, Equatable {
+        case unknownType(UInt8)
+        case tooLarge(Int)
+    }
+
+    let maxPayload: Int
+    private var buf: [UInt8] = []
+    private var pos = 0
+
+    init(maxPayload: Int = clipMaxBytes) { self.maxPayload = maxPayload }
+
+    mutating func feed(_ bytes: [UInt8]) throws -> [PeerMessage] {
+        buf.append(contentsOf: bytes)
+        var out: [PeerMessage] = []
+        while pos < buf.count {
+            let avail = buf.count - pos
+            let type = buf[pos]
+            if type == pktClipState {
+                guard avail >= 2 else { break }
+                let f = buf[pos + 1]
+                out.append(.clipboardState(enabled: f & clipFlagOn != 0, images: f & clipFlagImages != 0))
+                pos += 2
+            } else if type == pktClipboard {
+                guard avail >= 6 else { break }
+                let len = Int(buf[pos + 2]) | Int(buf[pos + 3]) << 8 | Int(buf[pos + 4]) << 16 | Int(buf[pos + 5]) << 24
+                if len > maxPayload { throw Failure.tooLarge(len) }
+                guard avail >= 6 + len else {
+                    buf.reserveCapacity(pos + 6 + len)
+                    break
+                }
+                out.append(.clipboard(kind: buf[pos + 1], data: Data(buf[(pos + 6)..<(pos + 6 + len)])))
+                pos += 6 + len
+            } else if type == pktPing {
+                guard avail >= 4 else { break }
+                pos += 4
+            } else {
+                throw Failure.unknownType(type)
+            }
+        }
+        if pos > 0 && (pos == buf.count || pos >= 65536) {  // drop what has been consumed
+            buf.removeFirst(pos)
+            pos = 0
+        }
+        return out
+    }
+}
 
 // MARK: - Saved preferences
 
@@ -86,6 +159,14 @@ final class Prefs {
     var swipeReverse: Bool {
         get { d.bool(forKey: "swipeReverse") }
         set { d.set(newValue, forKey: "swipeReverse") }
+    }
+    var clipboardSync: Bool {
+        get { (d.object(forKey: "clipboardSync") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "clipboardSync") }
+    }
+    var clipboardImages: Bool {
+        get { (d.object(forKey: "clipboardImages") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "clipboardImages") }
     }
     /// Emergency hotkey. Falls back to Control+Option+Command+W if the stored value is missing or unsafe.
     var hotkey: Hotkey {
@@ -181,8 +262,12 @@ final class Link {
     private var generation = 0
     private var fd: Int32 = -1
     private var state: LinkState = .idle
+    private var version = protoVersion   // what we offer; falls back to 2 for an older Windows app
+    private var peerVersion: UInt8 = 0   // protocol of the current connection, 0 = not connected
     private let sendQ = DispatchQueue(label: "mackeybridge.send")
     var onState: ((LinkState) -> Void)?
+    /// Messages from Windows (clipboard). Called on the link thread.
+    var onMessage: ((PeerMessage) -> Void)?
 
     init() {
         let t = Thread { [self] in self.loop() }
@@ -204,11 +289,19 @@ final class Link {
         return wanted
     }
 
+    /// Protocol version of the live connection (3 = with clipboard), 0 when not connected.
+    var peerProtocol: UInt8 {
+        lock.lock()
+        defer { lock.unlock() }
+        return peerVersion
+    }
+
     func connect(host: String, port: UInt16, secret: Data) {
         lock.lock()
         self.host = host
         self.port = port
         self.secret = secret
+        version = protoVersion  // a new attempt offers the newest protocol again
         wanted = true
         generation += 1
         let s = fd
@@ -271,6 +364,7 @@ final class Link {
             let h = host
             let p = port
             let sec = secret
+            let ver = version
             lock.unlock()
 
             if !w {
@@ -292,9 +386,17 @@ final class Link {
             }
             let s = opened.fd
 
-            let hs = handshake(s, secret: sec)
+            let hs = handshake(s, secret: sec, version: ver)
             if hs != .ok {
                 close(s)
+                if hs == .versionMismatch && ver > protoVersionLegacy {
+                    // An older MacKeyBridge.exe: speak protocol 2 with it (keyboard + trackpad, no clipboard).
+                    lock.lock()
+                    if generation == gen { version = protoVersionLegacy }
+                    lock.unlock()
+                    say("The Windows app is an older version: keyboard and trackpad work, clipboard sync needs the new MacKeyBridge.exe")
+                    continue
+                }
                 if hs.message != lastFailure {
                     say(hs.message)
                     lastFailure = hs.message
@@ -311,11 +413,15 @@ final class Link {
                 continue
             }
             fd = s
+            peerVersion = ver
             lock.unlock()
             lastFailure = ""
             setState(.connected)
-            say("Connected to Windows at \(h):\(p)")
+            say("Connected to Windows at \(h):\(p)" + (ver >= 3 ? "" : " (protocol \(ver), no clipboard sync)"))
 
+            var parser = PeerFrameParser()
+            var buf = [UInt8](repeating: 0, count: 65536)
+            var lastPing = 0.0
             var pfd = pollfd(fd: s, events: Int16(POLLIN), revents: 0)
             while true {
                 lock.lock()
@@ -323,22 +429,31 @@ final class Link {
                 lock.unlock()
                 if g != gen { break }
 
-                let r = poll(&pfd, 1, 1000)
+                let r = poll(&pfd, 1, 250)
                 if r < 0 {
                     if errno == EINTR { continue }
                     break
                 }
-                if r == 0 {  // idle for 1 s: ping (the server drops us after 3 s of silence)
+                // Keep-alive once per second, also while data is coming in (the server drops us after 3 s of silence).
+                let now = ProcessInfo.processInfo.systemUptime
+                if now - lastPing >= 1.0 {
+                    lastPing = now
                     enqueue([pktPing, 0, 0, 0])
-                    continue
                 }
-                var buf = [UInt8](repeating: 0, count: 64)
+                if r == 0 { continue }
                 let n = recv(s, &buf, buf.count, 0)
                 if n <= 0 { break }  // closed or error
+                do {
+                    for m in try parser.feed(Array(buf[0..<n])) { onMessage?(m) }
+                } catch {
+                    say("Unexpected data from Windows (\(error)) - reconnecting")
+                    break
+                }
             }
 
             lock.lock()
             fd = -1
+            peerVersion = 0
             lock.unlock()
             close(s)
 
@@ -434,11 +549,11 @@ final class Link {
     }
 
     /// server: [0x01][nonce 16]   client: [0x02][version][HMAC-SHA256(secret, nonce)]   server: [0x03] or [0x04][reason]
-    private func handshake(_ s: Int32, secret: Data) -> HandshakeResult {
+    private func handshake(_ s: Int32, secret: Data, version: UInt8) -> HandshakeResult {
         guard let ch = readExact(s, 17, timeoutMs: 3000), ch[0] == pktChallenge else { return .notServer }
         let nonce = Data(ch[1...16])
         let mac = HMAC<SHA256>.authenticationCode(for: nonce, using: SymmetricKey(data: secret))
-        var msg: [UInt8] = [pktAuth, protoVersion]
+        var msg: [UInt8] = [pktAuth, version]
         msg.append(contentsOf: Array(mac))
         guard writeAll(s, msg) else { return .failed }
         guard let r = readExact(s, 1, timeoutMs: 3000) else { return .failed }
@@ -743,6 +858,7 @@ struct MouseOptions {
 
 var gLink: Link!
 var gFwd: Forwarder!
+var gClip: ClipboardSync!
 var gApp: AppController!
 
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
@@ -883,6 +999,10 @@ final class Forwarder {
     private let swipe = SwipeRecognizer()
     private var swallowHotkeyUp = false
     private var warnedSecureInput = false
+
+    /// When input was last sent to the PC (systemUptime, main thread) - drives the activity lights in the window.
+    private(set) var lastKeyActivity = 0.0
+    private(set) var lastPointerActivity = 0.0
 
     init(link: Link) { self.link = link }
 
@@ -1083,10 +1203,12 @@ final class Forwarder {
     // MARK: sending
 
     private func sendKey(_ type: UInt8, _ code: UInt16, repeatFlag: Bool = false) {
+        lastKeyActivity = ProcessInfo.processInfo.systemUptime
         link.enqueue([type, repeatFlag ? 1 : 0, UInt8(code & 0xFF), UInt8(code >> 8)])
     }
 
     private func sendPair(_ type: UInt8, _ a: Int, _ b: Int) {
+        lastPointerActivity = ProcessInfo.processInfo.systemUptime
         let x = UInt16(bitPattern: Int16(clamping: a))
         let y = UInt16(bitPattern: Int16(clamping: b))
         link.enqueue([type, UInt8(x & 0xFF), UInt8(x >> 8), UInt8(y & 0xFF), UInt8(y >> 8)])
@@ -1242,6 +1364,7 @@ final class Forwarder {
                 button = (n >= 2 && n <= 4) ? UInt8(n) : 2
             }
             let down = (type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown)
+            lastPointerActivity = ProcessInfo.processInfo.systemUptime
             if down {
                 held.buttonDown(button)
                 link.enqueue([pktMouseButton, button, 1])
@@ -1451,6 +1574,35 @@ func runSelfTests() -> Int32 {
     h.reset()
     check("reset forgets everything", !h.modifiersHeld && h.keyUp(0) == false && h.buttonUp(1) == false)
 
+    // 13: clipboard frames (protocol 3).
+    let text = Data("Привет, Windows!\nline 2".utf8)
+    let pkt = clipboardPacket(kind: clipKindText, payload: text)
+    check("clipboard packet header is 6 bytes", pkt.count == 6 + text.count && pkt[0] == pktClipboard && pkt[1] == clipKindText)
+    var fp = PeerFrameParser()
+    let whole = (try? fp.feed(pkt)) ?? []
+    check("clipboard text round-trips", whole == [.clipboard(kind: clipKindText, data: text)])
+    fp = PeerFrameParser()
+    var pieces: [PeerMessage] = []
+    for i in stride(from: 0, to: pkt.count, by: 3) {  // arrives in tiny pieces
+        pieces += (try? fp.feed(Array(pkt[i..<min(i + 3, pkt.count)]))) ?? []
+    }
+    check("clipboard text split over many reads", pieces == [.clipboard(kind: clipKindText, data: text)])
+    fp = PeerFrameParser()
+    let two = (try? fp.feed([pktClipState, clipFlagOn | clipFlagImages, pktPing, 0, 0, 0, pktClipState, 0])) ?? []
+    check("state + ping + state in one read",
+          two == [.clipboardState(enabled: true, images: true), .clipboardState(enabled: false, images: false)])
+    fp = PeerFrameParser(maxPayload: 10)
+    var tooBig = false
+    do { _ = try fp.feed(clipboardPacket(kind: clipKindPNG, payload: Data(count: 11))) } catch { tooBig = true }
+    check("oversized clipboard is rejected", tooBig)
+    fp = PeerFrameParser()
+    var unknown = false
+    do { _ = try fp.feed([0x7F]) } catch { unknown = true }
+    check("unknown packet type is rejected", unknown)
+    fp = PeerFrameParser()
+    let empty = (try? fp.feed(clipboardPacket(kind: clipKindText, payload: Data()))) ?? []
+    check("empty clipboard payload is accepted", empty == [.clipboard(kind: clipKindText, data: Data())])
+
     print(failed == 0 ? "\nAll self-tests passed." : "\n\(failed) self-test(s) FAILED.")
     return failed == 0 ? 0 : 1
 }
@@ -1506,110 +1658,56 @@ func runDiagnose() -> Int32 {
     return 0
 }
 
-// MARK: - UI helpers
-
-func makeLabel(_ s: String, bold: Bool = false) -> NSTextField {
-    let t = NSTextField(labelWithString: s)
-    if bold { t.font = NSFont.boldSystemFont(ofSize: 13) }
-    return t
-}
-
-func makeLabel(_ s: String, width: CGFloat) -> NSTextField {
-    let t = NSTextField(labelWithString: s)
-    t.widthAnchor.constraint(equalToConstant: width).isActive = true
-    return t
-}
-
-func makeNote(_ s: String, width: CGFloat) -> NSTextField {
-    let t = NSTextField(wrappingLabelWithString: s)
-    t.font = NSFont.systemFont(ofSize: 11)
-    t.textColor = NSColor.secondaryLabelColor
-    t.preferredMaxLayoutWidth = width
-    t.widthAnchor.constraint(equalToConstant: width).isActive = true
-    return t
-}
-
-func makeRow(_ views: [NSView]) -> NSStackView {
-    let r = NSStackView(views: views)
-    r.orientation = .horizontal
-    r.alignment = .centerY
-    r.spacing = 8
-    return r
-}
-
-func makeSeparator(width: CGFloat) -> NSBox {
-    let b = NSBox()
-    b.boxType = .separator
-    b.widthAnchor.constraint(equalToConstant: width).isActive = true
-    return b
-}
-
-// MARK: - App controller (window, menu bar item, permissions)
+// MARK: - App controller (window, menu bar item, hotkey recording, permissions)
+//
+// The window itself is SwiftUI (UI.swift, `AppModel` + views). This class owns the AppKit side: lifecycle, menus,
+// the menu bar item, the emergency hotkey and the 1-second watchdog tick.
 
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
     var menuStateItem: NSMenuItem!
     var menuToggleItem: NSMenuItem!
+    var menuClipItem: NSMenuItem!
 
-    var hostField: NSTextField!
-    var portField: NSTextField!
-    var secretField: NSSecureTextField!
-    var connectButton: NSButton!
-    var statusLabel: NSTextField!
-    var forwardButton: NSButton!
-    var forwardHint: NSTextField!
-    var mouseCheck: NSButton!
-    var pointerSlider: NSSlider!
-    var pointerValue: NSTextField!
-    var scrollSlider: NSSlider!
-    var scrollValue: NSTextField!
-    var invertVCheck: NSButton!
-    var invertHCheck: NSButton!
-    var axLabel: NSTextField!
-    var imLabel: NSTextField!
-    var autoCheck: NSButton!
-    var logView: NSTextView!
-    var hotkeyLabel: NSTextField!
-    var hotkeyButton: NSButton!
-    var hotkeyResetButton: NSButton!
-    var navCheck: NSButton!
-    var swipeSlider: NSSlider!
-    var swipeValue: NSTextField!
-    var swipeKeysPopup: NSPopUpButton!
-    var swipeReverseCheck: NSButton!
-
+    let model = AppModel()
     let carbonHotkey = CarbonHotkey()
     var recordMonitor: Any?
     var timer: Timer?
-    var inputError: String?
 
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A previous instance that was killed while forwarding may have left the cursor detached: re-attach it.
         CGAssociateMouseAndMouseCursorPosition(1)
-        buildMenu()
-        buildWindow()
-        buildStatusItem()
-        gLogSink = { [weak self] line in self?.appendLog(line) }
+        gLogSink = { [weak self] line in self?.model.appendLog(line) }
 
         // Command line arguments override the saved values.
         let cli = parseArgs()
         if let h = cli.host { prefs.host = h }
         if let p = cli.port { prefs.port = p }
         if let s = cli.secret { prefs.secret = s }
-        loadControlsFromPrefs()
-        applyMouseOptions()
+        model.reloadConnectionFields()
+
+        buildMenu()
+        buildWindow()
+        buildStatusItem()
+
+        model.applyOptions()
         gFwd.hotkey = prefs.hotkey
         carbonHotkey.register(gFwd.hotkey)
 
         gLink.onState = { [weak self] st in
             // Immediately, on the link thread: losing the connection must never leave the Mac captured.
             if st != .connected { gFwd.stop(reason: "connection to Windows lost") }
+            gClip.linkStateChanged(st)
             DispatchQueue.main.async { self?.refreshUI() }
         }
+        gLink.onMessage = { m in gClip.handle(m) }
         gFwd.onChange = { [weak self] in self?.refreshUI() }
+        gClip.onUpdate = { [weak self] in self?.refreshUI() }
+        gClip.onTransfer = { [weak self] t in self?.model.clipboardTransferred(t) }
+        gClip.start()
 
         // Release the mouse whenever the Mac goes away from the user: sleep, screen sleep, fast user switching.
         let wsCenter = NSWorkspace.shared.notificationCenter
@@ -1623,11 +1721,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         requestPermissionsOnce()
         if !gFwd.installTap() { say("Waiting for Accessibility / Input Monitoring permission ...") }
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        model.startActivityTimer()
 
         refreshUI()
         showWindow()
         let canConnect = !prefs.host.isEmpty && !prefs.secret.isEmpty
-        if canConnect && ((cli.host != nil && cli.secret != nil) || prefs.autoConnect) { connectNow() }
+        if canConnect && ((cli.host != nil && cli.secret != nil) || prefs.autoConnect) { model.connect() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1669,6 +1768,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(appItem)
         let appMenu = NSMenu()
         appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "Hide MacKeyBridge", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit MacKeyBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         // An Edit menu makes Cmd+C / Cmd+V work in the text fields (e.g. to paste the secret).
@@ -1676,10 +1777,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(editItem)
         let editMenu = NSMenu(title: "Edit")
         editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        let winItem = NSMenuItem()
+        main.addItem(winItem)
+        let winMenu = NSMenu(title: "Window")
+        winItem.submenu = winMenu
+        winMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        winMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        NSApp.windowsMenu = winMenu
         NSApp.mainMenu = main
     }
 
@@ -1687,207 +1798,50 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menuStateItem = NSMenuItem(title: "Not connected", action: nil, keyEquivalent: "")
+        menuStateItem.isEnabled = false
         menu.addItem(menuStateItem)
         menu.addItem(NSMenuItem.separator())
-        let show = NSMenuItem(title: "Show Window", action: #selector(showWindow), keyEquivalent: "")
-        show.target = self
-        menu.addItem(show)
-        menuToggleItem = NSMenuItem(title: "Start forwarding", action: #selector(forwardClicked), keyEquivalent: "")
+        menuToggleItem = NSMenuItem(title: "Start Forwarding", action: #selector(forwardClicked), keyEquivalent: "")
         menuToggleItem.target = self
         menu.addItem(menuToggleItem)
+        menuClipItem = NSMenuItem(title: "Sync Clipboard", action: #selector(clipboardMenuClicked), keyEquivalent: "")
+        menuClipItem.target = self
+        menu.addItem(menuClipItem)
         menu.addItem(NSMenuItem.separator())
+        let show = NSMenuItem(title: "Open MacKeyBridge…", action: #selector(showWindow), keyEquivalent: "")
+        show.target = self
+        menu.addItem(show)
         let quit = NSMenuItem(title: "Quit MacKeyBridge", action: #selector(quitClicked), keyEquivalent: "")
         quit.target = self
         menu.addItem(quit)
+        menu.autoenablesItems = false
         statusItem.menu = menu
     }
 
     func buildWindow() {
-        let W: CGFloat = 468
-
-        hostField = NSTextField(frame: .zero)
-        hostField.placeholderString = "e.g. 192.168.0.10"
-        hostField.widthAnchor.constraint(equalToConstant: 300).isActive = true
-        portField = NSTextField(frame: .zero)
-        portField.widthAnchor.constraint(equalToConstant: 80).isActive = true
-        secretField = NSSecureTextField(frame: .zero)
-        secretField.placeholderString = "secret from the Windows settings"
-        secretField.widthAnchor.constraint(equalToConstant: 300).isActive = true
-
-        connectButton = NSButton(title: "Connect", target: self, action: #selector(connectClicked))
-        statusLabel = makeLabel("● Not connected")
-
-        forwardButton = NSButton(title: "Start forwarding", target: self, action: #selector(forwardClicked))
-        forwardHint = makeNote("", width: W)
-
-        mouseCheck = NSButton(checkboxWithTitle: "Forward trackpad / mouse too", target: self, action: #selector(optionsChanged))
-        pointerSlider = NSSlider(value: 1.0, minValue: 0.3, maxValue: 3.0, target: self, action: #selector(optionsChanged))
-        pointerSlider.widthAnchor.constraint(equalToConstant: 230).isActive = true
-        pointerValue = makeLabel("1.0x", width: 44)
-        scrollSlider = NSSlider(value: 1.0, minValue: 0.3, maxValue: 3.0, target: self, action: #selector(optionsChanged))
-        scrollSlider.widthAnchor.constraint(equalToConstant: 230).isActive = true
-        scrollValue = makeLabel("1.0x", width: 44)
-        invertVCheck = NSButton(checkboxWithTitle: "Invert vertical scroll", target: self, action: #selector(optionsChanged))
-        invertHCheck = NSButton(checkboxWithTitle: "Invert horizontal scroll", target: self, action: #selector(optionsChanged))
-
-        axLabel = makeLabel("Accessibility: ?", width: 230)
-        imLabel = makeLabel("Input Monitoring: ?", width: 230)
-        let axButton = NSButton(title: "Open settings...", target: self, action: #selector(openAX))
-        let imButton = NSButton(title: "Open settings...", target: self, action: #selector(openIM))
-        let lnButton = NSButton(title: "Open settings...", target: self, action: #selector(openLN))
-        autoCheck = NSButton(checkboxWithTitle: "Connect automatically when the app starts", target: self, action: #selector(optionsChanged))
-
-        hotkeyLabel = makeLabel("", width: 90)
-        hotkeyButton = NSButton(title: "Change...", target: self, action: #selector(changeHotkeyClicked))
-        hotkeyResetButton = NSButton(title: "Reset", target: self, action: #selector(resetHotkeyClicked))
-
-        navCheck = NSButton(checkboxWithTitle: "Two-finger horizontal swipe = previous / next slide or page", target: self, action: #selector(optionsChanged))
-        swipeSlider = NSSlider(value: 80, minValue: 30, maxValue: 300, target: self, action: #selector(optionsChanged))
-        swipeSlider.widthAnchor.constraint(equalToConstant: 230).isActive = true
-        swipeValue = makeLabel("80", width: 44)
-        swipeKeysPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        swipeKeysPopup.addItems(withTitles: ["Left / Right arrow", "Page Up / Page Down", "Mouse side buttons (Back / Forward)"])
-        swipeKeysPopup.target = self
-        swipeKeysPopup.action = #selector(optionsChanged)
-        swipeReverseCheck = NSButton(checkboxWithTitle: "Reverse swipe direction", target: self, action: #selector(optionsChanged))
-
-        let scroll = NSTextView.scrollableTextView()
-        logView = scroll.documentView as? NSTextView
-        logView.isEditable = false
-        logView.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        scroll.widthAnchor.constraint(equalToConstant: W).isActive = true
-        scroll.heightAnchor.constraint(equalToConstant: 84).isActive = true
-
-        var views: [NSView] = []
-        views.append(makeLabel("Windows PC", bold: true))
-        views.append(makeRow([makeLabel("Address", width: 70), hostField]))
-        views.append(makeRow([makeLabel("Port", width: 70), portField]))
-        views.append(makeRow([makeLabel("Secret", width: 70), secretField]))
-        views.append(makeRow([connectButton, statusLabel]))
-        views.append(makeSeparator(width: W))
-        views.append(makeLabel("Keyboard & trackpad", bold: true))
-        views.append(forwardButton)
-        views.append(forwardHint)
-        views.append(makeRow([makeLabel("Emergency hotkey", width: 120), hotkeyLabel, hotkeyButton, hotkeyResetButton]))
-        views.append(mouseCheck)
-        views.append(makeRow([makeLabel("Pointer speed", width: 100), pointerSlider, pointerValue]))
-        views.append(makeRow([makeLabel("Scroll speed", width: 100), scrollSlider, scrollValue]))
-        views.append(makeRow([invertVCheck, invertHCheck]))
-        views.append(makeSeparator(width: W))
-        views.append(makeLabel("Swipe navigation (slides / pages)", bold: true))
-        views.append(navCheck)
-        views.append(makeRow([makeLabel("Swipe distance", width: 100), swipeSlider, swipeValue]))
-        views.append(makeRow([makeLabel("Swipe sends", width: 100), swipeKeysPopup]))
-        views.append(swipeReverseCheck)
-        views.append(makeNote("Fingers left -> right = previous, right -> left = next. Works while forwarding; vertical scrolling is not affected.", width: W))
-        views.append(makeSeparator(width: W))
-        views.append(makeLabel("Permissions", bold: true))
-        views.append(makeRow([axLabel, axButton]))
-        views.append(makeRow([imLabel, imButton]))
-        views.append(makeRow([makeLabel("Local Network (needed to reach the PC)", width: 230), lnButton]))
-        views.append(autoCheck)
-        views.append(scroll)
-
-        let stack = NSStackView(views: views)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: 640))
-        content.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-        ])
-
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 640),
-                          styleMask: [.titled, .closable, .miniaturizable],
+        var height: CGFloat = 820
+        if let screen = NSScreen.main { height = min(height, screen.visibleFrame.height - 60) }
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: height),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "MacKeyBridge"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = content
-        content.layoutSubtreeIfNeeded()
-        window.setContentSize(NSSize(width: 500, height: stack.fittingSize.height + 32))
+        window.contentMinSize = NSSize(width: 560, height: 480)
+        window.contentView = makeMainContentView(model: model)
         window.center()
-    }
-
-    // MARK: preferences <-> controls
-
-    func loadControlsFromPrefs() {
-        hostField.stringValue = prefs.host
-        portField.stringValue = String(prefs.port)
-        secretField.stringValue = prefs.secret
-        mouseCheck.state = prefs.forwardMouse ? .on : .off
-        pointerSlider.doubleValue = prefs.pointerSpeed
-        scrollSlider.doubleValue = prefs.scrollSpeed
-        invertVCheck.state = prefs.invertV ? .on : .off
-        invertHCheck.state = prefs.invertH ? .on : .off
-        autoCheck.state = prefs.autoConnect ? .on : .off
-        navCheck.state = prefs.swipeNav ? .on : .off
-        swipeSlider.doubleValue = prefs.swipeThreshold
-        swipeKeysPopup.selectItem(at: min(max(prefs.swipeKeys, 0), 2))
-        swipeReverseCheck.state = prefs.swipeReverse ? .on : .off
-    }
-
-    func applyMouseOptions() {
-        gFwd.mouse = MouseOptions(enabled: prefs.forwardMouse, pointerSpeed: prefs.pointerSpeed,
-                                  scrollSpeed: prefs.scrollSpeed, invertV: prefs.invertV, invertH: prefs.invertH)
-        gFwd.nav = NavOptions(enabled: prefs.swipeNav, threshold: prefs.swipeThreshold,
-                              output: min(max(prefs.swipeKeys, 0), 2), reverse: prefs.swipeReverse)
-        gFwd.updateMouseCapture()
-    }
-
-    @objc func optionsChanged() {
-        prefs.forwardMouse = mouseCheck.state == .on
-        prefs.pointerSpeed = pointerSlider.doubleValue
-        prefs.scrollSpeed = scrollSlider.doubleValue
-        prefs.invertV = invertVCheck.state == .on
-        prefs.invertH = invertHCheck.state == .on
-        prefs.autoConnect = autoCheck.state == .on
-        prefs.swipeNav = navCheck.state == .on
-        prefs.swipeThreshold = swipeSlider.doubleValue
-        prefs.swipeKeys = min(max(swipeKeysPopup.indexOfSelectedItem, 0), 2)
-        prefs.swipeReverse = swipeReverseCheck.state == .on
-        applyMouseOptions()
-        refreshUI()
+        window.setFrameAutosaveName("MacKeyBridgeMainWindow")
     }
 
     // MARK: actions
 
-    @objc func connectClicked() {
-        if gLink.isWanted {
-            gLink.disconnect()
-            gFwd.stop(reason: "disconnect")
-            refreshUI()
-        } else {
-            connectNow()
-        }
-    }
-
-    func connectNow() {
-        let host = hostField.stringValue.trimmingCharacters(in: .whitespaces)
-        let secret = secretField.stringValue.trimmingCharacters(in: .whitespaces)
-        let portText = portField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !host.isEmpty, !secret.isEmpty, let port = UInt16(portText), port > 0 else {
-            inputError = "Fill in address, port (1-65535) and secret"
-            refreshUI()
-            return
-        }
-        inputError = nil
-        prefs.host = host
-        prefs.port = Int(port)
-        prefs.secret = secret
-        gLink.connect(host: host, port: port, secret: Data(secret.utf8))
-        refreshUI()
-    }
-
     @objc func forwardClicked() { gFwd.toggle() }
+
+    @objc func clipboardMenuClicked() { model.clipboardSync.toggle() }
 
     // MARK: hotkey recording
 
-    @objc func changeHotkeyClicked() {
+    func changeHotkey() {
         if recordMonitor != nil {
             stopRecording()
             return
@@ -1898,7 +1852,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         gFwd.recordingHotkey = true  // no hotkey fires while we listen for the new one
         carbonHotkey.unregister()    // otherwise the old combination would be consumed before our window sees it
-        hotkeyButton.title = "Press keys... (Esc = cancel)"
+        model.recordingHotkey = true
         recordMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] ev in
             self?.recorded(ev)
             return nil  // swallow it, no beep
@@ -1939,7 +1893,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordMonitor = nil
         gFwd.recordingHotkey = false
         carbonHotkey.register(gFwd.hotkey)
-        hotkeyButton.title = "Change..."
+        model.recordingHotkey = false
         refreshUI()
     }
 
@@ -1950,21 +1904,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         say("Emergency hotkey is now \(hk.display)")
     }
 
-    @objc func resetHotkeyClicked() {
+    func resetHotkey() {
         if recordMonitor != nil { stopRecording() }
         setHotkey(Hotkey())
         refreshUI()
     }
+
+    // MARK: permissions
 
     func openPane(_ anchor: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
             NSWorkspace.shared.open(url)
         }
     }
-
-    @objc func openAX() { openPane("Privacy_Accessibility") }
-    @objc func openIM() { openPane("Privacy_ListenEvent") }
-    @objc func openLN() { openPane("Privacy_LocalNetwork") }
 
     func requestPermissionsOnce() {
         if !AXIsProcessTrusted() {
@@ -1975,83 +1927,33 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: refreshing
 
-    func appendLog(_ line: String) {
-        guard let tv = logView else { return }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
-            .foregroundColor: NSColor.textColor,
-        ]
-        tv.textStorage?.append(NSAttributedString(string: line + "\n", attributes: attrs))
-        if let ts = tv.textStorage, ts.length > 20000 { ts.deleteCharacters(in: NSRange(location: 0, length: 10000)) }
-        tv.scrollToEndOfDocument(nil)
-    }
-
     func refreshUI() {
-        guard window != nil else { return }
+        guard window != nil, statusItem != nil else { return }
+        model.refresh()
+
         let st = gLink.currentState
         let fwd = gFwd.forwarding
-
-        switch st {
-        case .idle:
-            if let e = inputError {
-                statusLabel.stringValue = "● " + e
-                statusLabel.textColor = NSColor.systemRed
-            } else {
-                statusLabel.stringValue = "● Not connected"
-                statusLabel.textColor = NSColor.secondaryLabelColor
-            }
-        case .connecting:
-            statusLabel.stringValue = "● Connecting..."
-            statusLabel.textColor = NSColor.systemOrange
-        case .connected:
-            statusLabel.stringValue = "● Connected"
-            statusLabel.textColor = NSColor.systemGreen
-        case .failed(let msg):
-            statusLabel.stringValue = "● " + msg
-            statusLabel.textColor = NSColor.systemRed
-        }
-        connectButton.title = gLink.isWanted ? "Disconnect" : "Connect"
-
         let hk = gFwd.hotkey.display
-        let ready = gFwd.ready  // tap installed AND Accessibility AND Input Monitoring granted
-        forwardButton.isEnabled = (st == .connected) && ready
-        forwardButton.title = fwd ? "Stop forwarding  (\(hk))" : "Start forwarding  (\(hk))"
-        if !ready {
-            forwardHint.stringValue = "Grant Accessibility and Input Monitoring below (both are required). Forwarding becomes available automatically."
-        } else if fwd {
-            forwardHint.stringValue = "The Mac keyboard and trackpad now control the Windows PC. Press \(hk) to get them back on this Mac (clicking here will not work while the trackpad is forwarded)."
-        } else {
-            forwardHint.stringValue = "Press \(hk) from any app to start or stop forwarding."
+        if let b = statusItem.button {
+            let symbol = fwd ? "keyboard.fill" : "keyboard"
+            let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "MacKeyBridge")
+                ?? NSImage(systemSymbolName: "keyboard", accessibilityDescription: "MacKeyBridge")
+            img?.isTemplate = true
+            b.image = img
+            b.imagePosition = .imageLeading
+            b.title = fwd ? " → PC" : (img == nil ? "⌨" : "")
+            b.appearsDisabled = st != .connected
+            b.toolTip = fwd ? "MacKeyBridge: forwarding to Windows (\(hk) to stop)"
+                : (st == .connected ? "MacKeyBridge: connected" : "MacKeyBridge: not connected")
         }
-        hotkeyLabel.stringValue = hk
-        hotkeyButton.isEnabled = !fwd
-        hotkeyResetButton.isEnabled = !fwd
-
-        pointerValue.stringValue = String(format: "%.1fx", pointerSlider.doubleValue)
-        scrollValue.stringValue = String(format: "%.1fx", scrollSlider.doubleValue)
-        let mouseOn = mouseCheck.state == .on
-        pointerSlider.isEnabled = mouseOn
-        scrollSlider.isEnabled = mouseOn
-        invertVCheck.isEnabled = mouseOn
-        invertHCheck.isEnabled = mouseOn
-        swipeValue.stringValue = String(format: "%.0f", swipeSlider.doubleValue)
-        navCheck.isEnabled = mouseOn
-        let navOn = mouseOn && navCheck.state == .on
-        swipeSlider.isEnabled = navOn
-        swipeKeysPopup.isEnabled = navOn
-        swipeReverseCheck.isEnabled = navOn
-
-        let ax = AXIsProcessTrusted()
-        let im = CGPreflightListenEventAccess()
-        axLabel.stringValue = "Accessibility: " + (ax ? "✓ granted" : "✗ not granted")
-        axLabel.textColor = ax ? NSColor.systemGreen : NSColor.systemRed
-        imLabel.stringValue = "Input Monitoring: " + (im ? "✓ granted" : "✗ not granted")
-        imLabel.textColor = im ? NSColor.systemGreen : NSColor.systemRed
-
-        statusItem.button?.title = fwd ? "⌨ → PC" : (st == .connected ? "⌨ PC ✓" : "⌨ PC ✗")
-        menuStateItem.title = st == .connected ? "Connected to Windows" : "Not connected"
-        menuToggleItem.title = fwd ? "Stop forwarding (\(hk))" : "Start forwarding (\(hk))"
-        menuToggleItem.isEnabled = forwardButton.isEnabled
+        switch st {
+        case .connected: menuStateItem.title = fwd ? "Forwarding to Windows" : "Connected to Windows"
+        case .connecting: menuStateItem.title = "Connecting…"
+        default: menuStateItem.title = "Not connected"
+        }
+        menuToggleItem.title = fwd ? "Stop Forwarding  (\(hk))" : "Start Forwarding  (\(hk))"
+        menuToggleItem.isEnabled = fwd || (st == .connected && gFwd.ready)
+        menuClipItem.state = model.clipboardSync ? .on : .off
     }
 }
 
@@ -2071,6 +1973,7 @@ for sig in [SIGINT, SIGTERM, SIGHUP] {
 
 gLink = Link()
 gFwd = Forwarder(link: gLink)
+gClip = ClipboardSync(link: gLink)
 gApp = AppController()
 
 let app = NSApplication.shared
