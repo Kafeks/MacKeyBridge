@@ -1,3 +1,4 @@
+import Carbon  // RegisterEventHotKey: permission-free global hotkey (emergency fallback)
 import Cocoa
 import CoreGraphics
 import CryptoKit
@@ -28,8 +29,6 @@ let pktPing: UInt8 = 0x13
 let pktMouseMove: UInt8 = 0x20
 let pktMouseButton: UInt8 = 0x21
 let pktMouseWheel: UInt8 = 0x22
-
-let hotkeyCode: UInt16 = 13  // kVK_ANSI_W -> Control+Option+Command+W toggles forwarding
 
 // MARK: - Saved preferences
 
@@ -72,8 +71,6 @@ final class Prefs {
         get { d.bool(forKey: "autoConnect") }
         set { d.set(newValue, forKey: "autoConnect") }
     }
-<<<<<<< HEAD
-=======
     var swipeNav: Bool {
         get { (d.object(forKey: "swipeNav") as? Bool) ?? true }
         set { d.set(newValue, forKey: "swipeNav") }
@@ -105,7 +102,6 @@ final class Prefs {
             d.set(newValue.name, forKey: "hotkeyName")
         }
     }
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 }
 
 let prefs = Prefs()
@@ -126,7 +122,10 @@ Usage: MacKeyBridge [--host <windows-ip>] [--port 47800] [--secret <secret>]
   --secret   shared secret from the MacKeyBridge settings (or env MACKEYBRIDGE_SECRET)
 
 Without arguments the window opens and uses the saved settings.
-Start/stop forwarding with Control+Option+Command+W.
+Start/stop forwarding with the emergency hotkey (default Control+Option+Command+W, changeable in the window).
+
+  --selftest   run the built-in logic tests (swipe recognizer, hotkey, stuck-key bookkeeping) and exit
+  --diagnose   print the permission state and count the events an event tap really receives (8 s), then exit
 """
 
 func parseArgs() -> CLIOptions {
@@ -452,9 +451,6 @@ final class Link {
     }
 }
 
-<<<<<<< HEAD
-// MARK: - Event tap (keyboard, trackpad / mouse, media keys)
-=======
 // MARK: - Emergency hotkey
 
 let ctrlFlag = CGEventFlags.maskControl.rawValue
@@ -721,7 +717,6 @@ final class MouseCapture {
 // MARK: - Event taps
 
 let gestureEventTypes: [UInt32] = [18, 19, 20, 29, 30, 31, 32, 34]  // rotate, begin/end gesture, gesture, magnify, swipe, smart magnify, pressure
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
 
 // NX_KEYTYPE_* values we forward as media keys (code = 0x100 + value on the wire).
 let forwardedMediaKeys: Set<Int> = [0, 1, 7, 16, 17, 18, 19, 20]  // vol up/down, mute, play, next, prev, ff, rew
@@ -754,31 +749,190 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     return gFwd.handle(type: type, event: event)
 }
 
+let panicCallback: CGEventTapCallBack = { _, type, event, _ in
+    return gFwd.panicHandle(type: type, event: event)
+}
+
+/// A second, tiny event tap that does nothing but watch for the hotkey. It runs on its own thread, so a stalled or busy
+/// main thread cannot delay it, and it is created after the main tap so it sits in front of it.
+final class PanicTap {
+    private let lock = NSLock()
+    private var starting = false
+    private var tap: CFMachPort?
+    private var warned = false
+
+    var running: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return tap != nil || starting
+    }
+
+    func ensureRunning() {
+        lock.lock()
+        if tap != nil || starting {
+            lock.unlock()
+            return
+        }
+        starting = true
+        lock.unlock()
+        let t = Thread { [self] in self.run() }
+        t.name = "mackeybridge.panic"
+        t.qualityOfService = .userInteractive
+        t.start()
+    }
+
+    private func run() {
+        let mask = (CGEventMask(1) << CGEventMask(CGEventType.keyDown.rawValue))
+            | (CGEventMask(1) << CGEventMask(CGEventType.keyUp.rawValue))
+        guard let port = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: panicCallback,
+            userInfo: nil
+        ) else {
+            lock.lock()
+            starting = false
+            let first = !warned
+            warned = true
+            lock.unlock()
+            if first { say("Emergency hotkey tap could not be created yet (the Carbon hotkey and the main tap still work)") }
+            return
+        }
+        lock.lock()
+        tap = port
+        starting = false
+        lock.unlock()
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        CGEvent.tapEnable(tap: port, enable: true)
+        CFRunLoopRun()
+    }
+
+    func reenable() {
+        lock.lock()
+        let t = tap
+        lock.unlock()
+        if let t = t { CGEvent.tapEnable(tap: t, enable: true) }
+    }
+
+    var enabled: Bool {
+        lock.lock()
+        let t = tap
+        lock.unlock()
+        guard let tt = t else { return false }
+        return CGEvent.tapIsEnabled(tap: tt)
+    }
+}
+
+/// Permission-free global hotkey (Carbon RegisterEventHotKey). It keeps working when the event taps do not see
+/// keystrokes (permission revoked, tap disabled, Secure Event Input), so it is the last line of defence.
+final class CarbonHotkey {
+    private var ref: EventHotKeyRef?
+    private var handler: EventHandlerRef?
+
+    func register(_ hk: Hotkey) {
+        unregister()
+        if handler == nil {
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            let st = InstallEventHandler(GetEventDispatcherTarget(), { (_, _, _) -> OSStatus in
+                gFwd.hotkeyFired("Carbon hotkey")
+                return noErr
+            }, 1, &spec, nil, &handler)
+            if st != noErr { say("Carbon hotkey handler not installed (status \(st))") }
+        }
+        let id = EventHotKeyID(signature: OSType(0x4D4B4252), id: 1)  // 'MKBR'
+        let st = RegisterEventHotKey(UInt32(hk.code), hk.carbonModifiers, id, GetEventDispatcherTarget(), 0, &ref)
+        if st != noErr { say("Carbon hotkey \(hk.display) not registered (status \(st)); the event taps still handle it") }
+    }
+
+    func unregister() {
+        if let r = ref {
+            UnregisterEventHotKey(r)
+            ref = nil
+        }
+    }
+}
+
+func permissionStatus() -> (ax: Bool, im: Bool) {
+    return (AXIsProcessTrusted(), CGPreflightListenEventAccess())
+}
+
 final class Forwarder {
     let link: Link
     var tap: CFMachPort?
     var onChange: (() -> Void)?
-    var mouse = MouseOptions()
+    var mouse = MouseOptions()   // main thread only (the main tap runs on the main thread)
+    var nav = NavOptions()       // main thread only
+    let capture = MouseCapture()
+    let panic = PanicTap()
 
-    private var mouseCaptured = false
+    // State shared with the emergency paths (any thread) - always accessed under stateLock.
+    private let stateLock = NSLock()
+    private var _forwarding = false
+    private var _hotkey = Hotkey()
+    private var _recording = false
+    private var _needsReset = false
+    private var lastHotkeyFire = -100.0
+
+    // Main-thread-only bookkeeping (reset lazily through _needsReset).
+    private var held = HeldState()
     private var accX = 0.0, accY = 0.0       // pointer remainders (sub-pixel movement is not lost)
     private var accSX = 0.0, accSY = 0.0     // scroll remainders
+    private let swipe = SwipeRecognizer()
+    private var swallowHotkeyUp = false
+    private var warnedSecureInput = false
 
-    var forwarding = false {
-        didSet {
-            if oldValue != forwarding {
-                updateMouseCapture()
-                onChange?()
-            }
+    init(link: Link) { self.link = link }
+
+    var forwarding: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _forwarding
+    }
+
+    var hotkey: Hotkey {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _hotkey
+        }
+        set {
+            stateLock.lock()
+            _hotkey = newValue
+            stateLock.unlock()
+        }
+    }
+
+    /// While the user is recording a new hotkey, no hotkey fires.
+    var recordingHotkey: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _recording
+        }
+        set {
+            stateLock.lock()
+            _recording = newValue
+            stateLock.unlock()
         }
     }
 
     var tapInstalled: Bool { tap != nil }
 
-    init(link: Link) { self.link = link }
+    /// Forwarding can start only with the tap installed AND both privacy permissions granted. With Accessibility alone
+    /// macOS creates the tap but does not deliver keystrokes, which would leave the hotkey dead.
+    var ready: Bool {
+        let p = permissionStatus()
+        return tap != nil && p.ax && p.im
+    }
 
     func installTap() -> Bool {
-        if tap != nil { return true }
+        if tap != nil {
+            panic.ensureRunning()
+            return true
+        }
         var mask: CGEventMask = 0
         let types: [CGEventType] = [
             .keyDown, .keyUp, .flagsChanged,
@@ -788,6 +942,7 @@ final class Forwarder {
         ]
         for t in types { mask |= CGEventMask(1) << CGEventMask(t.rawValue) }
         mask |= CGEventMask(1) << CGEventMask(14)  // NSEventType.systemDefined: media keys
+        for g in gestureEventTypes { mask |= CGEventMask(1) << CGEventMask(g) }  // pinch / rotate / swipe: keep them off the Mac while forwarding
 
         guard let port = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -802,36 +957,126 @@ final class Forwarder {
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: port, enable: true)
+        panic.ensureRunning()  // created after the main tap -> sits in front of it
         return true
     }
 
+    // MARK: start / stop
+
     func toggle() {
-        if !forwarding {
-            guard link.connected else {
-                say("Not connected to Windows yet - forwarding not enabled")
-                return
-            }
-            guard tap != nil else {
-                say("Keyboard capture is not active - grant Accessibility + Input Monitoring first")
-                return
-            }
-            accX = 0; accY = 0; accSX = 0; accSY = 0
-            forwarding = true
-            say("Forwarding ON: keyboard and trackpad now control Windows (Control+Option+Command+W to stop)")
+        if forwarding { stop(reason: "button or menu") } else { start() }
+    }
+
+    /// Main thread.
+    func start() {
+        if forwarding { return }
+        guard link.connected else {
+            say("Not connected to Windows yet - forwarding not enabled")
+            return
+        }
+        guard tap != nil else {
+            say("Keyboard capture is not active - grant Accessibility + Input Monitoring first")
+            return
+        }
+        let p = permissionStatus()
+        guard p.ax && p.im else {
+            var missing: [String] = []
+            if !p.ax { missing.append("Accessibility") }
+            if !p.im { missing.append("Input Monitoring") }
+            say("Forwarding not started: \(missing.joined(separator: " and ")) permission missing. Grant it in System Settings -> Privacy & Security.")
+            notifyChanged()
+            return
+        }
+        stateLock.lock()
+        _forwarding = true
+        _needsReset = true
+        stateLock.unlock()
+        updateMouseCapture()
+        say("Forwarding ON: keyboard and trackpad now control Windows (\(hotkey.display) to stop)")
+        notifyChanged()
+    }
+
+    /// Any thread. Idempotent. The mouse is released first, before anything that could fail or block.
+    func stop(reason: String) {
+        stateLock.lock()
+        let was = _forwarding
+        _forwarding = false
+        _needsReset = true
+        stateLock.unlock()
+        capture.release()
+        if was {
+            link.enqueue([pktAllUp, 0, 0, 0])  // release every key and mouse button still held on the PC
+            say("Forwarding OFF (\(reason)): keyboard and trackpad are back on this Mac")
+        }
+        notifyChanged()
+    }
+
+    /// Detach / re-attach the cursor so that it matches "forwarding && trackpad forwarding enabled". Main thread.
+    func updateMouseCapture() {
+        if forwarding && mouse.enabled {
+            capture.engage()
+            if !forwarding { capture.release() }  // an emergency stop raced with us: it wins
         } else {
-            link.enqueue([pktAllUp, 0, 0, 0])  // release anything still held on the PC
-            forwarding = false
-            say("Forwarding OFF: keyboard and trackpad are back on this Mac")
+            capture.release()
         }
     }
 
-    /// While forwarding the trackpad, detach the cursor from the pointer so the Mac cursor stays put
-    /// (relative movement is still reported to the event tap).
-    func updateMouseCapture() {
-        let want = forwarding && mouse.enabled
-        if want != mouseCaptured {
-            mouseCaptured = want
-            CGAssociateMouseAndMouseCursorPosition(want ? 0 : 1)
+    private func notifyChanged() {
+        DispatchQueue.main.async { [self] in self.onChange?() }
+    }
+
+    /// Called from the main tap, the emergency tap and the Carbon hotkey - one key press may arrive through
+    /// several of them, so duplicates within 0.4 s are dropped.
+    func hotkeyFired(_ source: String) {
+        stateLock.lock()
+        let now = ProcessInfo.processInfo.systemUptime
+        if _recording || now - lastHotkeyFire < 0.4 {
+            stateLock.unlock()
+            return
+        }
+        lastHotkeyFire = now
+        let on = _forwarding
+        stateLock.unlock()
+        if on {
+            stop(reason: "hotkey via \(source)")  // immediately, on whatever thread we are on
+        } else {
+            DispatchQueue.main.async { [self] in self.start() }
+        }
+    }
+
+    private func hotkeyMatches(_ code: UInt16, _ flags: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return !_recording && _hotkey.matches(code: code, flags: flags)
+    }
+
+    private func takeReset() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let r = _needsReset
+        _needsReset = false
+        return r
+    }
+
+    /// Once per second on the main thread: nothing may be left captured.
+    func watchdog() {
+        if let t = tap, !CGEvent.tapIsEnabled(tap: t) {
+            if forwarding { stop(reason: "event tap was switched off") }
+            CGEvent.tapEnable(tap: t, enable: true)
+        }
+        if tap != nil {
+            if !panic.running { panic.ensureRunning() } else if !panic.enabled { panic.reenable() }
+        }
+        if forwarding {
+            let p = permissionStatus()
+            if !(p.ax && p.im) { stop(reason: "a privacy permission was revoked") }
+            if IsSecureEventInputEnabled() && !warnedSecureInput {
+                warnedSecureInput = true
+                say("Secure Event Input is on (a password field or Secure Keyboard Entry): keystrokes may not reach MacKeyBridge. The hotkey still works.")
+            }
+        } else {
+            warnedSecureInput = false
+            if capture.isActive { capture.release() }  // invariant: never captured while not forwarding
         }
     }
 
@@ -847,8 +1092,6 @@ final class Forwarder {
         link.enqueue([type, UInt8(x & 0xFF), UInt8(x >> 8), UInt8(y & 0xFF), UInt8(y >> 8)])
     }
 
-<<<<<<< HEAD
-=======
     private func sendScroll(_ px: Double, _ py: Double) {
         let k = 3.0 * mouse.scrollSpeed  // 120 wheel units (one notch) ~ 40 pixels
         accSY += py * k * (mouse.invertV ? -1.0 : 1.0)
@@ -880,35 +1123,85 @@ final class Forwarder {
         say(next ? "Swipe: next slide / page" : "Swipe: previous slide / page")
     }
 
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
     // MARK: event handling
 
-    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        // macOS disables a tap that is too slow; switch it back on.
+    /// The emergency tap (own thread): only looks for the hotkey, never blocks, never touches UI.
+    private var panicSwallowUp: UInt16 = 0xFFFF  // only touched by the emergency tap's thread
+
+    func panicHandle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            panic.reenable()
+            return Unmanaged.passUnretained(event)
+        }
+        guard type == .keyDown || type == .keyUp else { return Unmanaged.passUnretained(event) }
+        let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
+        if type == .keyDown {
+            if hotkeyMatches(code, event.flags.rawValue) {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 { hotkeyFired("emergency tap") }
+                panicSwallowUp = code
+                return nil
+            }
+        } else if code == panicSwallowUp {
+            panicSwallowUp = 0xFFFF
+            return nil
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // macOS switched the tap off (too slow / user input): until it is back nothing is intercepted and the hotkey
+        // might be missed, so never stay captured.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            stop(reason: "event tap was disabled by macOS")
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             return Unmanaged.passUnretained(event)
         }
 
-        // Control+Option+Command+W always works, even while forwarding.
+        if takeReset() {
+            // A start/stop happened since the last event. If something is still marked held, an event of ours raced with
+            // an emergency stop on another thread and was sent after its ALL_UP: release it on the PC again.
+            if !held.isEmpty { link.enqueue([pktAllUp, 0, 0, 0]) }
+            held.reset()
+            accX = 0; accY = 0; accSX = 0; accSY = 0
+            swipe.reset()
+        }
+
+        // The hotkey (fallback path: the emergency tap normally sees it first). Never forwarded.
         if type == .keyDown || type == .keyUp {
             let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
-            let hot: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand]
-            if code == hotkeyCode && event.flags.isSuperset(of: hot) {
-                if type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 { toggle() }
+            if type == .keyDown, hotkeyMatches(code, event.flags.rawValue) {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 { hotkeyFired("main tap") }
+                swallowHotkeyUp = true
+                return nil
+            }
+            if type == .keyUp, swallowHotkeyUp, code == hotkey.code {
+                swallowHotkeyUp = false
                 return nil
             }
         }
 
-        // Safety: only swallow input while the link is up, otherwise the Mac keeps working normally.
-        guard forwarding, link.connected else { return Unmanaged.passUnretained(event) }
+        // Safety: only swallow input while forwarding and while the link is up, otherwise the Mac keeps working normally.
+        guard forwarding else { return Unmanaged.passUnretained(event) }
+        guard link.connected else {
+            stop(reason: "connection to Windows lost")
+            return Unmanaged.passUnretained(event)
+        }
 
         switch type {
-        case .keyDown, .keyUp:
+        case .keyDown:
             let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
-            let rep = type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-            sendKey(type == .keyDown ? pktKeyDown : pktKeyUp, code, repeatFlag: rep)
+            let rep = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            held.keyDown(code)
+            sendKey(pktKeyDown, code, repeatFlag: rep)
             return nil
+
+        case .keyUp:
+            let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
+            if held.keyUp(code) {
+                sendKey(pktKeyUp, code)
+                return nil
+            }
+            return Unmanaged.passUnretained(event)  // pressed before forwarding started: the Mac needs to see the release
 
         case .flagsChanged:
             // Modifier keys (and Fn / Globe = key code 63) arrive as flagsChanged with their own key code.
@@ -916,18 +1209,19 @@ final class Forwarder {
             let raw = event.flags.rawValue
             switch code {
             case 63:  // Fn / Globe
-                let down = (raw & CGEventFlags.maskSecondaryFn.rawValue) != 0
-                sendKey(down ? pktKeyDown : pktKeyUp, code)
+                return forwardModifier(code, down: (raw & CGEventFlags.maskSecondaryFn.rawValue) != 0, event)
             case 57:  // Caps Lock reports state changes, not key presses: send one tap per event
                 sendKey(pktKeyDown, code)
                 sendKey(pktKeyUp, code)
+                return nil
             default:
-                if let m = deviceMask[code] { sendKey((raw & m) != 0 ? pktKeyDown : pktKeyUp, code) }
+                if let m = deviceMask[code] { return forwardModifier(code, down: (raw & m) != 0, event) }
+                return nil
             }
-            return nil
 
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             guard mouse.enabled else { return Unmanaged.passUnretained(event) }
+            capture.checkDrift(event.location)
             accX += event.getDoubleValueField(.mouseEventDeltaX) * mouse.pointerSpeed
             accY += event.getDoubleValueField(.mouseEventDeltaY) * mouse.pointerSpeed
             let ix = Int(accX)  // truncates toward zero; the fraction stays in the accumulator
@@ -948,27 +1242,69 @@ final class Forwarder {
                 button = (n >= 2 && n <= 4) ? UInt8(n) : 2
             }
             let down = (type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown)
-            link.enqueue([pktMouseButton, button, down ? 1 : 0])
-            return nil
+            if down {
+                held.buttonDown(button)
+                link.enqueue([pktMouseButton, button, 1])
+                return nil
+            }
+            if held.buttonUp(button) {
+                link.enqueue([pktMouseButton, button, 0])
+                return nil
+            }
+            return Unmanaged.passUnretained(event)  // pressed on the Mac before forwarding started
 
         case .scrollWheel:
             guard mouse.enabled else { return Unmanaged.passUnretained(event) }
-            let py = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))  // pixels, + = up
-            let px = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
-            let k = 3.0 * mouse.scrollSpeed  // 120 wheel units (one notch) ~ 40 pixels
-            accSY += py * k * (mouse.invertV ? -1.0 : 1.0)
-            accSX += -px * k * (mouse.invertH ? -1.0 : 1.0)  // Mac + = scroll left, Windows + = scroll right
-            let iy = Int(accSY)
-            let ix = Int(accSX)
-            accSY -= Double(iy)
-            accSX -= Double(ix)
-            if ix != 0 || iy != 0 { sendPair(pktMouseWheel, ix, iy) }
-            return nil
+            return handleScroll(event)
 
         default:
             if type.rawValue == 14 { return handleSystemDefined(event) }
+            if gestureEventTypes.contains(type.rawValue) {
+                if mouse.enabled { return nil }  // pinch / rotate / swipe must not act on the Mac under the frozen cursor
+            }
             return Unmanaged.passUnretained(event)
         }
+    }
+
+    private func forwardModifier(_ code: UInt16, down: Bool, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+        if down {
+            held.keyDown(code)
+            sendKey(pktKeyDown, code)
+            return nil
+        }
+        if held.keyUp(code) {
+            sendKey(pktKeyUp, code)
+            return nil
+        }
+        return Unmanaged.passUnretained(event)  // released a modifier that was pressed before forwarding started
+    }
+
+    /// Scrolling: a two-finger trackpad gesture is either a swipe (horizontal) or an ordinary scroll (vertical);
+    /// a real mouse wheel, or anything while a modifier is held, is forwarded as before.
+    private func handleScroll(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+        let py = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))  // pixels, + = up
+        let px = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
+        var result = ScrollResult.scroll(x: px, y: py)
+
+        let continuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0  // trackpad / Magic Mouse
+        let noModifiers = (event.flags.rawValue & hotkeyModMask) == 0 && !held.modifiersHeld
+        if nav.enabled, continuous, noModifiers, let ns = NSEvent(cgEvent: event) {
+            let phase = scrollPhaseKind(ns.phase)
+            let momentum = !ns.momentumPhase.isEmpty
+            if phase != .none || momentum {
+                // Natural scrolling: content follows the fingers, so the delta sign is the finger direction.
+                let fingerX = ns.isDirectionInvertedFromDevice ? px : -px
+                result = swipe.feed(rawX: px, rawY: py, fingerX: fingerX, phase: phase, momentum: momentum,
+                                    threshold: nav.threshold, now: ProcessInfo.processInfo.systemUptime)
+            }
+        }
+
+        switch result {
+        case .none: break
+        case .scroll(let x, let y): sendScroll(x, y)
+        case .swipe(let forward): sendSwipe(next: forward != nav.reverse)
+        }
+        return nil
     }
 
     /// Media keys (volume, play/pause, next, previous) come as NSSystemDefined subtype 8.
@@ -987,6 +1323,187 @@ final class Forwarder {
         if isDown { sendKey(pktKeyDown, UInt16(0x100 + keyType), repeatFlag: isRepeat) }
         return nil
     }
+}
+
+// MARK: - Self test and diagnostics (command line: --selftest, --diagnose)
+
+func runSelfTests() -> Int32 {
+    var failed = 0
+    func check(_ name: String, _ ok: Bool) {
+        print((ok ? "PASS  " : "FAIL  ") + name)
+        if !ok { failed += 1 }
+    }
+
+    typealias S = (dx: Double, dy: Double, p: ScrollPhaseKind, m: Bool, t: Double)
+    /// Runs the recognizer over events; `fingerX` equals the raw dx here (natural scrolling).
+    func run(_ r: SwipeRecognizer, _ events: [S], threshold: Double = 80) -> [ScrollResult] {
+        return events.map {
+            r.feed(rawX: $0.dx, rawY: $0.dy, fingerX: $0.dx, phase: $0.p, momentum: $0.m, threshold: threshold, now: $0.t)
+        }
+    }
+    /// A gesture: began, `n - 1` x changed, ended. Each event moves (dx, dy); 10 ms apart, starting at t0.
+    func gesture(dx: Double, dy: Double, n: Int, t0: Double) -> [S] {
+        var e: [S] = []
+        for i in 0..<n {
+            let p: ScrollPhaseKind = i == 0 ? .began : .changed
+            e.append((dx, dy, p, false, t0 + Double(i) * 0.01))
+        }
+        e.append((0, 0, .ended, false, t0 + Double(n) * 0.01))
+        return e
+    }
+    func swipes(_ rs: [ScrollResult]) -> [Bool] {
+        return rs.compactMap { (x: ScrollResult) -> Bool? in
+            if case .swipe(let f) = x { return f }
+            return nil
+        }
+    }
+    func scrollSum(_ rs: [ScrollResult]) -> (x: Double, y: Double) {
+        var x = 0.0, y = 0.0
+        for r in rs { if case .scroll(let a, let b) = r { x += a; y += b } }
+        return (x, y)
+    }
+
+    // 1/2: direction. Fingers left -> right (+dx) = previous (forward == false); right -> left = next.
+    var r = SwipeRecognizer()
+    check("swipe left->right fires one 'previous'", swipes(run(r, gesture(dx: 25, dy: 1, n: 8, t0: 100))) == [false])
+    r = SwipeRecognizer()
+    check("swipe right->left fires one 'next'", swipes(run(r, gesture(dx: -25, dy: -1, n: 8, t0: 100))) == [true])
+
+    // 3: a long horizontal gesture still fires only once, and its inertia does nothing.
+    r = SwipeRecognizer()
+    var ev = gesture(dx: 30, dy: 0, n: 30, t0: 100)
+    ev.append((20, 0, .none, true, 100.5))
+    ev.append((10, 0, .none, true, 100.52))
+    let rs3 = run(r, ev)
+    check("long horizontal gesture: exactly one swipe", swipes(rs3).count == 1)
+    check("horizontal gesture + inertia: nothing is scrolled", scrollSum(rs3).x == 0 && scrollSum(rs3).y == 0)
+
+    // 4: vertical scrolling never swipes and loses no distance (the held-back start is flushed).
+    r = SwipeRecognizer()
+    let rs4 = run(r, gesture(dx: 1, dy: 20, n: 20, t0: 100))
+    check("vertical scroll: no swipe", swipes(rs4).isEmpty)
+    check("vertical scroll: full distance forwarded (400)", scrollSum(rs4).y == 400)
+    check("vertical scroll: no sideways leak", scrollSum(rs4).x == 0)
+
+    // 5: vertical inertia keeps scrolling.
+    r = SwipeRecognizer()
+    var ev5 = gesture(dx: 0, dy: 15, n: 10, t0: 100)
+    ev5.append((0, 9, .none, true, 100.3))
+    ev5.append((0, 4, .none, true, 100.32))
+    check("vertical inertia is forwarded (150 + 13)", scrollSum(run(r, ev5)).y == 163)
+
+    // 6: small horizontal movement (below the threshold) does nothing at all.
+    r = SwipeRecognizer()
+    let rs6 = run(r, gesture(dx: 5, dy: 0, n: 8, t0: 100))  // 40 points in total
+    check("small horizontal movement: no swipe", swipes(rs6).isEmpty)
+    check("small horizontal movement: not scrolled either", scrollSum(rs6).x == 0)
+
+    // 7: diagonal gesture that is mostly vertical is a scroll.
+    r = SwipeRecognizer()
+    check("mostly vertical diagonal: no swipe", swipes(run(r, gesture(dx: 20, dy: 40, n: 10, t0: 100))).isEmpty)
+
+    // 8: two separate gestures = two swipes; a second one within the cooldown is dropped.
+    r = SwipeRecognizer()
+    var ev8 = gesture(dx: 30, dy: 0, n: 6, t0: 100)
+    ev8 += gesture(dx: 30, dy: 0, n: 6, t0: 100.6)
+    check("two gestures 0.6 s apart: two swipes", swipes(run(r, ev8)).count == 2)
+    r = SwipeRecognizer()
+    var ev8b = gesture(dx: 30, dy: 0, n: 4, t0: 100)
+    ev8b += gesture(dx: 30, dy: 0, n: 4, t0: 100.08)
+    check("second swipe inside the cooldown is dropped", swipes(run(r, ev8b)).count == 1)
+
+    // 9: a missed 'began' (long silence) starts a new gesture instead of continuing the latched one.
+    r = SwipeRecognizer()
+    var ev9 = gesture(dx: 30, dy: 0, n: 5, t0: 100)
+    ev9.append((30, 0, .changed, false, 105.0))
+    ev9.append((30, 0, .changed, false, 105.01))
+    ev9.append((30, 0, .changed, false, 105.02))
+    check("stale state: events after a long gap start a new gesture", swipes(run(r, ev9)).count == 2)
+
+    // 10: a configurable threshold.
+    r = SwipeRecognizer()
+    check("threshold 300: a 200-point swipe does not fire", swipes(run(r, gesture(dx: 25, dy: 0, n: 8, t0: 100), threshold: 300)).isEmpty)
+    r = SwipeRecognizer()
+    check("threshold 30: a 200-point swipe fires", swipes(run(r, gesture(dx: 25, dy: 0, n: 8, t0: 100), threshold: 30)).count == 1)
+
+    // 11: hotkey matching.
+    let hk = Hotkey()
+    check("default hotkey is Control+Option+Command+W", hk.display == "⌃⌥⌘W" && hk.code == 13)
+    check("hotkey matches its chord", hk.matches(code: 13, flags: ctrlFlag | optFlag | cmdFlag))
+    check("hotkey tolerates an extra Shift", hk.matches(code: 13, flags: ctrlFlag | optFlag | cmdFlag | shiftFlag))
+    check("hotkey needs every modifier", !hk.matches(code: 13, flags: ctrlFlag | cmdFlag))
+    check("hotkey needs the right key", !hk.matches(code: 14, flags: ctrlFlag | optFlag | cmdFlag))
+    var single = Hotkey()
+    single.flags = cmdFlag
+    check("a single-modifier hotkey is rejected", !single.isValid && hk.isValid)
+
+    // 12: stuck-key protection.
+    var h = HeldState()
+    check("release of a key pressed before forwarding is not swallowed", h.keyUp(55) == false)
+    h.keyDown(55)
+    check("modifier held is reported", h.modifiersHeld)
+    check("release of a forwarded key is forwarded", h.keyUp(55) == true)
+    check("... only once", h.keyUp(55) == false)
+    h.buttonDown(0)
+    check("forwarded mouse button is released once", h.buttonUp(0) == true && h.buttonUp(0) == false)
+    h.keyDown(0)
+    h.buttonDown(1)
+    h.reset()
+    check("reset forgets everything", !h.modifiersHeld && h.keyUp(0) == false && h.buttonUp(1) == false)
+
+    print(failed == 0 ? "\nAll self-tests passed." : "\n\(failed) self-test(s) FAILED.")
+    return failed == 0 ? 0 : 1
+}
+
+var gDiag: [String: Int] = [:]
+
+let diagCallback: CGEventTapCallBack = { _, type, event, _ in
+    let name: String
+    switch type {
+    case .keyDown: name = "keyDown"
+    case .keyUp: name = "keyUp"
+    case .flagsChanged: name = "flagsChanged"
+    case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged: name = "pointer move/drag"
+    case .leftMouseDown, .rightMouseDown, .otherMouseDown: name = "button down"
+    case .scrollWheel: name = "scroll"
+    default: name = "other (\(type.rawValue))"
+    }
+    gDiag[name, default: 0] += 1
+    return Unmanaged.passUnretained(event)
+}
+
+/// Prints the privacy-permission state and counts the events a tap really receives for 8 seconds.
+func runDiagnose() -> Int32 {
+    let p = permissionStatus()
+    print("Accessibility:      " + (p.ax ? "granted" : "NOT granted"))
+    print("Input Monitoring:   " + (p.im ? "granted" : "NOT granted"))
+    print("Secure Event Input: " + (IsSecureEventInputEnabled() ? "ON (an app is blocking keyboard taps)" : "off"))
+
+    var mask: CGEventMask = 0
+    let types: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .mouseMoved, .leftMouseDown, .rightMouseDown, .scrollWheel]
+    for t in types { mask |= CGEventMask(1) << CGEventMask(t.rawValue) }
+    guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                       eventsOfInterest: mask, callback: diagCallback, userInfo: nil) else {
+        print("\nCould not create an event tap: grant Accessibility and Input Monitoring to this app (or to your terminal) first.")
+        return 2
+    }
+    let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+    CGEvent.tapEnable(tap: port, enable: true)
+    print("\nListening for 8 seconds - type something, move the pointer, click and scroll with two fingers ...")
+    CFRunLoopRunInMode(.defaultMode, 8, false)
+
+    print("\nEvents received by the tap:")
+    if gDiag.isEmpty { print("  (none)") }
+    for (k, v) in gDiag.sorted(by: { $0.key < $1.key }) { print("  \(k): \(v)") }
+    let keys = (gDiag["keyDown"] ?? 0) + (gDiag["flagsChanged"] ?? 0)
+    if keys == 0 {
+        print("\nNo keyboard events arrived. If you typed: Input Monitoring is missing, or Secure Event Input is on.")
+        print("MacKeyBridge then cannot see its hotkey through the event tap (the Carbon hotkey fallback still works).")
+    } else {
+        print("\nKeyboard events are delivered - the event taps work.")
+    }
+    return 0
 }
 
 // MARK: - UI helpers
@@ -1053,13 +1570,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var imLabel: NSTextField!
     var autoCheck: NSButton!
     var logView: NSTextView!
+    var hotkeyLabel: NSTextField!
+    var hotkeyButton: NSButton!
+    var hotkeyResetButton: NSButton!
+    var navCheck: NSButton!
+    var swipeSlider: NSSlider!
+    var swipeValue: NSTextField!
+    var swipeKeysPopup: NSPopUpButton!
+    var swipeReverseCheck: NSButton!
 
+    let carbonHotkey = CarbonHotkey()
+    var recordMonitor: Any?
     var timer: Timer?
     var inputError: String?
 
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A previous instance that was killed while forwarding may have left the cursor detached: re-attach it.
+        CGAssociateMouseAndMouseCursorPosition(1)
         buildMenu()
         buildWindow()
         buildStatusItem()
@@ -1072,14 +1601,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let s = cli.secret { prefs.secret = s }
         loadControlsFromPrefs()
         applyMouseOptions()
+        gFwd.hotkey = prefs.hotkey
+        carbonHotkey.register(gFwd.hotkey)
 
         gLink.onState = { [weak self] st in
-            DispatchQueue.main.async {
-                if st != .connected { gFwd.forwarding = false }
-                self?.refreshUI()
-            }
+            // Immediately, on the link thread: losing the connection must never leave the Mac captured.
+            if st != .connected { gFwd.stop(reason: "connection to Windows lost") }
+            DispatchQueue.main.async { self?.refreshUI() }
         }
         gFwd.onChange = { [weak self] in self?.refreshUI() }
+
+        // Release the mouse whenever the Mac goes away from the user: sleep, screen sleep, fast user switching.
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
+                     NSWorkspace.sessionDidResignActiveNotification] {
+            wsCenter.addObserver(forName: name, object: nil, queue: nil) { note in
+                gFwd.stop(reason: note.name.rawValue)
+            }
+        }
 
         requestPermissionsOnce()
         if !gFwd.installTap() { say("Waiting for Accessibility / Input Monitoring permission ...") }
@@ -1092,7 +1631,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        gFwd.forwarding = false  // gives the Mac cursor back
+        gFwd.stop(reason: "quit")  // gives the Mac cursor back
+        carbonHotkey.unregister()
         gLink.disconnect()
     }
 
@@ -1117,6 +1657,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func tick() {
         if !gFwd.tapInstalled && gFwd.installTap() { say("Keyboard and trackpad capture is active") }
+        gFwd.watchdog()
         refreshUI()
     }
 
@@ -1196,8 +1737,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let lnButton = NSButton(title: "Open settings...", target: self, action: #selector(openLN))
         autoCheck = NSButton(checkboxWithTitle: "Connect automatically when the app starts", target: self, action: #selector(optionsChanged))
 
-<<<<<<< HEAD
-=======
         hotkeyLabel = makeLabel("", width: 90)
         hotkeyButton = NSButton(title: "Change...", target: self, action: #selector(changeHotkeyClicked))
         hotkeyResetButton = NSButton(title: "Reset", target: self, action: #selector(resetHotkeyClicked))
@@ -1212,7 +1751,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         swipeKeysPopup.action = #selector(optionsChanged)
         swipeReverseCheck = NSButton(checkboxWithTitle: "Reverse swipe direction", target: self, action: #selector(optionsChanged))
 
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
         let scroll = NSTextView.scrollableTextView()
         logView = scroll.documentView as? NSTextView
         logView.isEditable = false
@@ -1230,10 +1768,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         views.append(makeLabel("Keyboard & trackpad", bold: true))
         views.append(forwardButton)
         views.append(forwardHint)
+        views.append(makeRow([makeLabel("Emergency hotkey", width: 120), hotkeyLabel, hotkeyButton, hotkeyResetButton]))
         views.append(mouseCheck)
         views.append(makeRow([makeLabel("Pointer speed", width: 100), pointerSlider, pointerValue]))
         views.append(makeRow([makeLabel("Scroll speed", width: 100), scrollSlider, scrollValue]))
         views.append(makeRow([invertVCheck, invertHCheck]))
+        views.append(makeSeparator(width: W))
+        views.append(makeLabel("Swipe navigation (slides / pages)", bold: true))
+        views.append(navCheck)
+        views.append(makeRow([makeLabel("Swipe distance", width: 100), swipeSlider, swipeValue]))
+        views.append(makeRow([makeLabel("Swipe sends", width: 100), swipeKeysPopup]))
+        views.append(swipeReverseCheck)
+        views.append(makeNote("Fingers left -> right = previous, right -> left = next. Works while forwarding; vertical scrolling is not affected.", width: W))
         views.append(makeSeparator(width: W))
         views.append(makeLabel("Permissions", bold: true))
         views.append(makeRow([axLabel, axButton]))
@@ -1279,23 +1825,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         invertVCheck.state = prefs.invertV ? .on : .off
         invertHCheck.state = prefs.invertH ? .on : .off
         autoCheck.state = prefs.autoConnect ? .on : .off
-<<<<<<< HEAD
-=======
         navCheck.state = prefs.swipeNav ? .on : .off
         swipeSlider.doubleValue = prefs.swipeThreshold
         swipeKeysPopup.selectItem(at: min(max(prefs.swipeKeys, 0), 2))
         swipeReverseCheck.state = prefs.swipeReverse ? .on : .off
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
     }
 
     func applyMouseOptions() {
         gFwd.mouse = MouseOptions(enabled: prefs.forwardMouse, pointerSpeed: prefs.pointerSpeed,
                                   scrollSpeed: prefs.scrollSpeed, invertV: prefs.invertV, invertH: prefs.invertH)
-<<<<<<< HEAD
-=======
         gFwd.nav = NavOptions(enabled: prefs.swipeNav, threshold: prefs.swipeThreshold,
                               output: min(max(prefs.swipeKeys, 0), 2), reverse: prefs.swipeReverse)
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
         gFwd.updateMouseCapture()
     }
 
@@ -1306,13 +1846,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         prefs.invertV = invertVCheck.state == .on
         prefs.invertH = invertHCheck.state == .on
         prefs.autoConnect = autoCheck.state == .on
-<<<<<<< HEAD
-=======
         prefs.swipeNav = navCheck.state == .on
         prefs.swipeThreshold = swipeSlider.doubleValue
         prefs.swipeKeys = min(max(swipeKeysPopup.indexOfSelectedItem, 0), 2)
         prefs.swipeReverse = swipeReverseCheck.state == .on
->>>>>>> fe5b228 (Add mouse side-button swipe navigation)
         applyMouseOptions()
         refreshUI()
     }
@@ -1322,7 +1859,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func connectClicked() {
         if gLink.isWanted {
             gLink.disconnect()
-            gFwd.forwarding = false
+            gFwd.stop(reason: "disconnect")
             refreshUI()
         } else {
             connectNow()
@@ -1347,6 +1884,77 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func forwardClicked() { gFwd.toggle() }
+
+    // MARK: hotkey recording
+
+    @objc func changeHotkeyClicked() {
+        if recordMonitor != nil {
+            stopRecording()
+            return
+        }
+        if gFwd.forwarding {
+            say("Stop forwarding before changing the hotkey")
+            return
+        }
+        gFwd.recordingHotkey = true  // no hotkey fires while we listen for the new one
+        carbonHotkey.unregister()    // otherwise the old combination would be consumed before our window sees it
+        hotkeyButton.title = "Press keys... (Esc = cancel)"
+        recordMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] ev in
+            self?.recorded(ev)
+            return nil  // swallow it, no beep
+        }
+    }
+
+    func recorded(_ ev: NSEvent) {
+        let code = UInt16(ev.keyCode)
+        let mods = ev.modifierFlags
+        if code == 53 && !mods.contains(.control) && !mods.contains(.option) && !mods.contains(.command) {
+            stopRecording()  // plain Esc cancels
+            return
+        }
+        var hk = Hotkey()
+        hk.code = code
+        hk.flags = 0
+        if mods.contains(.control) { hk.flags |= ctrlFlag }
+        if mods.contains(.option) { hk.flags |= optFlag }
+        if mods.contains(.shift) { hk.flags |= shiftFlag }
+        if mods.contains(.command) { hk.flags |= cmdFlag }
+        if let special = specialKeyNames[code] {
+            hk.name = special
+        } else if let c = ev.charactersIgnoringModifiers?.uppercased(), !c.isEmpty {
+            hk.name = c
+        } else {
+            hk.name = "Key \(code)"
+        }
+        guard hk.isValid else {
+            say("The hotkey needs at least two of Control, Option, Command (for example Control+Option+Command+W) - try again")
+            return
+        }
+        setHotkey(hk)
+        stopRecording()
+    }
+
+    func stopRecording() {
+        if let m = recordMonitor { NSEvent.removeMonitor(m) }
+        recordMonitor = nil
+        gFwd.recordingHotkey = false
+        carbonHotkey.register(gFwd.hotkey)
+        hotkeyButton.title = "Change..."
+        refreshUI()
+    }
+
+    func setHotkey(_ hk: Hotkey) {
+        prefs.hotkey = hk
+        gFwd.hotkey = hk
+        carbonHotkey.register(hk)
+        say("Emergency hotkey is now \(hk.display)")
+    }
+
+    @objc func resetHotkeyClicked() {
+        if recordMonitor != nil { stopRecording() }
+        setHotkey(Hotkey())
+        refreshUI()
+    }
 
     func openPane(_ anchor: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
@@ -1404,15 +2012,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         connectButton.title = gLink.isWanted ? "Disconnect" : "Connect"
 
-        forwardButton.isEnabled = (st == .connected) && gFwd.tapInstalled
-        forwardButton.title = fwd ? "Stop forwarding  (⌃⌥⌘W)" : "Start forwarding  (⌃⌥⌘W)"
-        if !gFwd.tapInstalled {
-            forwardHint.stringValue = "Grant Accessibility and Input Monitoring below. Forwarding becomes available automatically."
+        let hk = gFwd.hotkey.display
+        let ready = gFwd.ready  // tap installed AND Accessibility AND Input Monitoring granted
+        forwardButton.isEnabled = (st == .connected) && ready
+        forwardButton.title = fwd ? "Stop forwarding  (\(hk))" : "Start forwarding  (\(hk))"
+        if !ready {
+            forwardHint.stringValue = "Grant Accessibility and Input Monitoring below (both are required). Forwarding becomes available automatically."
         } else if fwd {
-            forwardHint.stringValue = "The Mac keyboard and trackpad now control the Windows PC. Press Control+Option+Command+W to get them back on this Mac (clicking here will not work while the trackpad is forwarded)."
+            forwardHint.stringValue = "The Mac keyboard and trackpad now control the Windows PC. Press \(hk) to get them back on this Mac (clicking here will not work while the trackpad is forwarded)."
         } else {
-            forwardHint.stringValue = "Press Control+Option+Command+W from any app to start or stop forwarding."
+            forwardHint.stringValue = "Press \(hk) from any app to start or stop forwarding."
         }
+        hotkeyLabel.stringValue = hk
+        hotkeyButton.isEnabled = !fwd
+        hotkeyResetButton.isEnabled = !fwd
 
         pointerValue.stringValue = String(format: "%.1fx", pointerSlider.doubleValue)
         scrollValue.stringValue = String(format: "%.1fx", scrollSlider.doubleValue)
@@ -1421,6 +2034,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         scrollSlider.isEnabled = mouseOn
         invertVCheck.isEnabled = mouseOn
         invertHCheck.isEnabled = mouseOn
+        swipeValue.stringValue = String(format: "%.0f", swipeSlider.doubleValue)
+        navCheck.isEnabled = mouseOn
+        let navOn = mouseOn && navCheck.state == .on
+        swipeSlider.isEnabled = navOn
+        swipeKeysPopup.isEnabled = navOn
+        swipeReverseCheck.isEnabled = navOn
 
         let ax = AXIsProcessTrusted()
         let im = CGPreflightListenEventAccess()
@@ -1431,22 +2050,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         statusItem.button?.title = fwd ? "⌨ → PC" : (st == .connected ? "⌨ PC ✓" : "⌨ PC ✗")
         menuStateItem.title = st == .connected ? "Connected to Windows" : "Not connected"
-        menuToggleItem.title = fwd ? "Stop forwarding (⌃⌥⌘W)" : "Start forwarding (⌃⌥⌘W)"
+        menuToggleItem.title = fwd ? "Stop forwarding (\(hk))" : "Start forwarding (\(hk))"
         menuToggleItem.isEnabled = forwardButton.isEnabled
     }
 }
 
 // MARK: - Main
 
+if CommandLine.arguments.contains("--selftest") { exit(runSelfTests()) }
+if CommandLine.arguments.contains("--diagnose") { exit(runDiagnose()) }
+
 signal(SIGPIPE, SIG_IGN)
 // Never leave the Mac cursor frozen if we are killed from the terminal.
-signal(SIGINT) { _ in
-    CGAssociateMouseAndMouseCursorPosition(1)
-    exit(0)
-}
-signal(SIGTERM) { _ in
-    CGAssociateMouseAndMouseCursorPosition(1)
-    exit(0)
+for sig in [SIGINT, SIGTERM, SIGHUP] {
+    signal(sig) { _ in
+        CGAssociateMouseAndMouseCursorPosition(1)
+        exit(0)
+    }
 }
 
 gLink = Link()
