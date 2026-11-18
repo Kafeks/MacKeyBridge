@@ -8,7 +8,8 @@ APP="MacKeyBridge.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
-swiftc -O main.swift Clipboard.swift KeyboardMapping.swift UI.swift -o "$APP/Contents/MacOS/MacKeyBridge"
+SWIFT_TARGET="$(uname -m)-apple-macosx12.0"
+swiftc -O -target "$SWIFT_TARGET" main.swift Clipboard.swift KeyboardMapping.swift UI.swift -o "$APP/Contents/MacOS/MacKeyBridge"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

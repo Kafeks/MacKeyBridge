@@ -184,6 +184,30 @@ final class Prefs {
         get { (d.object(forKey: "cmdTabToAltTab") as? Bool) ?? true }
         set { d.set(newValue, forKey: "cmdTabToAltTab") }
     }
+    var themePreset: Int {
+        get { d.object(forKey: "themePreset") as? Int ?? ThemePreset.midnight.rawValue }
+        set { d.set(newValue, forKey: "themePreset") }
+    }
+    var appearanceMode: Int {
+        get { d.object(forKey: "appearanceMode") as? Int ?? AppearanceMode.system.rawValue }
+        set { d.set(newValue, forKey: "appearanceMode") }
+    }
+    var liquidGlassEnabled: Bool {
+        get { (d.object(forKey: "liquidGlassEnabled") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "liquidGlassEnabled") }
+    }
+    var useCustomAccent: Bool {
+        get { (d.object(forKey: "useCustomAccent") as? Bool) ?? false }
+        set { d.set(newValue, forKey: "useCustomAccent") }
+    }
+    var customAccent: String {
+        get { d.string(forKey: "customAccent") ?? "#5E9BFF" }
+        set { d.set(newValue, forKey: "customAccent") }
+    }
+    var selectedTab: Int {
+        get { d.object(forKey: "selectedTab") as? Int ?? 0 }
+        set { d.set(newValue, forKey: "selectedTab") }
+    }
     /// Emergency hotkey. Falls back to Control+Option+Command+W if the stored value is missing or unsafe.
     var hotkey: Hotkey {
         get {
@@ -1788,6 +1812,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A previous instance that was killed while forwarding may have left the cursor detached: re-attach it.
         CGAssociateMouseAndMouseCursorPosition(1)
         gLogSink = { [weak self] line in self?.model.appendLog(line) }
+        DistributedNotificationCenter.default().addObserver(self,
+            selector: #selector(systemAppearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"), object: nil)
 
         // Command line arguments override the saved values.
         let cli = parseArgs()
@@ -1798,6 +1825,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         buildMenu()
         buildWindow()
+        applyAppearance()
         buildStatusItem()
 
         model.applyOptions()
@@ -1926,18 +1954,35 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func buildWindow() {
-        var height: CGFloat = 820
+        var height: CGFloat = 760
         if let screen = NSScreen.main { height = min(height, screen.visibleFrame.height - 60) }
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: height),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: height),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         window.title = "MacKeyBridge"
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentMinSize = NSSize(width: 560, height: 480)
+        window.contentMinSize = NSSize(width: 580, height: 540)
         window.contentView = makeMainContentView(model: model)
         window.center()
-        window.setFrameAutosaveName("MacKeyBridgeMainWindow")
+        window.setFrameAutosaveName("MacKeyBridgeMainWindowRedesign")
+    }
+
+    func applyAppearance() {
+        switch model.appearance {
+        case .system: NSApp.appearance = nil
+        case .light: NSApp.appearance = NSAppearance(named: .aqua)
+        case .dark: NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        model.systemAppearanceTick += 1
+    }
+
+    @objc func systemAppearanceChanged() {
+        model.systemAppearanceTick += 1
     }
 
     // MARK: actions

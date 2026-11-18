@@ -46,6 +46,42 @@ final class AppModel: ObservableObject {
         didSet { prefs.cmdTabToAltTab = cmdTabToAltTab; applyOptions() }
     }
 
+    // Appearance
+    @Published var theme = ThemePreset(rawValue: prefs.themePreset) ?? .midnight {
+        didSet { prefs.themePreset = theme.rawValue }
+    }
+    @Published var appearance = AppearanceMode(rawValue: prefs.appearanceMode) ?? .system {
+        didSet { prefs.appearanceMode = appearance.rawValue; gApp?.applyAppearance() }
+    }
+    @Published var liquidGlassEnabled = prefs.liquidGlassEnabled {
+        didSet { prefs.liquidGlassEnabled = liquidGlassEnabled }
+    }
+    @Published var useCustomAccent = prefs.useCustomAccent {
+        didSet { prefs.useCustomAccent = useCustomAccent }
+    }
+    @Published var customAccent = prefs.customAccent {
+        didSet { prefs.customAccent = customAccent }
+    }
+    @Published var systemAppearanceTick = 0
+    @Published var selectedTab = min(max(prefs.selectedTab, 0), MainTab.allCases.count - 1) {
+        didSet { prefs.selectedTab = selectedTab }
+    }
+
+    var resolvedAppearance: ThemeAppearance {
+        switch appearance {
+        case .light: return .light
+        case .dark: return .dark
+        case .system:
+            return NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .dark : .light
+        }
+    }
+
+    var palette: ThemePalette { theme.palette(for: resolvedAppearance) }
+
+    var effectiveAccent: Color {
+        useCustomAccent ? Color(hex: customAccent) : palette.defaultAccent
+    }
+
     // Trackpad
     @Published var forwardMouse = prefs.forwardMouse {
         didSet { prefs.forwardMouse = forwardMouse; applyOptions() }
@@ -258,6 +294,217 @@ final class AppModel: ObservableObject {
     }
 }
 
+// MARK: - Appearance
+
+enum ThemeAppearance {
+    case light, dark
+}
+
+enum AppearanceMode: Int, CaseIterable, Identifiable, Hashable {
+    case system = 0, light = 1, dark = 2
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .system: return "circle.lefthalf.filled"
+        case .light: return "sun.max"
+        case .dark: return "moon"
+        }
+    }
+}
+
+struct ThemePalette {
+    let background: Color
+    let glow: Color
+    let glowSecondary: Color
+    let panel: Color
+    let panelBorder: Color
+    let inset: Color
+    let text: Color
+    let secondaryText: Color
+    let defaultAccent: Color
+    let material: NSVisualEffectView.Material
+}
+
+private func makePalette(background: Color, glow: Color, glowSecondary: Color, panel: Color,
+                         panelBorder: Color, inset: Color, text: Color, secondaryText: Color,
+                         defaultAccent: Color, material: NSVisualEffectView.Material) -> ThemePalette {
+    return ThemePalette(background: background, glow: glow, glowSecondary: glowSecondary,
+                        panel: panel, panelBorder: panelBorder, inset: inset, text: text,
+                        secondaryText: secondaryText, defaultAccent: defaultAccent,
+                        material: material)
+}
+
+private func darkPalette(_ background: String, _ glow: String, _ glowSecondary: String,
+                         _ accent: String, secondaryAlpha: Double = 0.64) -> ThemePalette {
+    return makePalette(background: Color(hex: background), glow: Color(hex: glow),
+                       glowSecondary: Color(hex: glowSecondary), panel: .white.opacity(0.07),
+                       panelBorder: .white.opacity(0.11), inset: .white.opacity(0.05),
+                       text: .white, secondaryText: .white.opacity(secondaryAlpha),
+                        defaultAccent: Color(hex: accent), material: .hudWindow)
+
+}
+
+private func lightPalette(_ background: String, _ glow: String, _ glowSecondary: String,
+                          _ text: String, _ secondary: String, _ accent: String) -> ThemePalette {
+    return makePalette(background: Color(hex: background), glow: Color(hex: glow),
+                       glowSecondary: Color(hex: glowSecondary), panel: .white.opacity(0.86),
+                       panelBorder: .black.opacity(0.07), inset: .black.opacity(0.045),
+                       text: Color(hex: text), secondaryText: Color(hex: secondary),
+                        defaultAccent: Color(hex: accent), material: .underWindowBackground)
+
+}
+
+enum ThemePreset: Int, CaseIterable, Identifiable, Hashable {
+    case midnight = 0
+    case obsidian = 1
+    case aurora = 2
+    case ocean = 3
+    case emerald = 4
+    case sunset = 5
+    case snow = 6
+    case classicMacOS = 7
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .midnight: return "Midnight"
+        case .obsidian: return "Obsidian"
+        case .aurora: return "Aurora"
+        case .ocean: return "Ocean"
+        case .emerald: return "Emerald"
+        case .sunset: return "Sunset"
+        case .snow: return "Snow"
+        case .classicMacOS: return "Classic macOS"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .midnight: return "Graphite · blue"
+        case .obsidian: return "Charcoal · silver"
+        case .aurora: return "Violet · cyan"
+        case .ocean: return "Navy · turquoise"
+        case .emerald: return "Forest · mint"
+        case .sunset: return "Coral · amber"
+        case .snow: return "White · soft gray"
+        case .classicMacOS: return "Native system"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .midnight: return "moon.stars.fill"
+        case .obsidian: return "diamond.fill"
+        case .aurora: return "sparkles"
+        case .ocean: return "water.waves"
+        case .emerald: return "leaf.fill"
+        case .sunset: return "sunrise.fill"
+        case .snow: return "snowflake"
+        case .classicMacOS: return "applelogo"
+        }
+    }
+
+    func palette(for appearance: ThemeAppearance) -> ThemePalette {
+        switch self {
+        case .midnight:
+            return appearance == .dark
+                ? darkPalette("#070A12", "#173A6B", "#0E2440", "#5E9BFF")
+                : lightPalette("#EEF2F8", "#CFDDF3", "#E7EEF9", "#111827", "#5A6474", "#2F6FED")
+        case .obsidian:
+            return appearance == .dark
+                ? darkPalette("#111214", "#454A53", "#262A31", "#B8C0CC")
+                : lightPalette("#F2F2F4", "#DCDDE1", "#EAEAEE", "#1D1D1F", "#6E6E73", "#5D6470")
+        case .aurora:
+            return appearance == .dark
+                ? darkPalette("#090714", "#5B2E8F", "#12617E", "#A78BFA", secondaryAlpha: 0.68)
+                : lightPalette("#F4F1FB", "#DFD2F7", "#D3EDFA", "#241B3A", "#6C6280", "#7C3AED")
+        case .ocean:
+            return appearance == .dark
+                ? darkPalette("#04121F", "#0C5F80", "#0A3A50", "#34C6D9")
+                : lightPalette("#EEF8FA", "#C8EBF1", "#DDF3F7", "#0B2A38", "#4E7382", "#0E8FA8")
+        case .emerald:
+            return appearance == .dark
+                ? darkPalette("#05140F", "#0F6347", "#0A3A2B", "#34D399")
+                : lightPalette("#EFF8F3", "#CDEEDD", "#E1F4EA", "#0C2A1E", "#527565", "#079455")
+        case .sunset:
+            return appearance == .dark
+                ? darkPalette("#170C14", "#7E3553", "#8A4A18", "#FB7185", secondaryAlpha: 0.68)
+                : lightPalette("#FDF3EE", "#FADACB", "#EDDAFA", "#3B1D2B", "#8A6474", "#E11D48")
+        case .snow:
+            return appearance == .dark
+                ? darkPalette("#1C1E22", "#38414F", "#2B323C", "#64B5FF", secondaryAlpha: 0.70)
+                : lightPalette("#F7F8FA", "#E6EDF7", "#F0F4FA", "#111827", "#5B6472", "#0A84FF")
+        case .classicMacOS:
+            let dark = appearance == .dark
+            return makePalette(
+                background: Color(nsColor: .windowBackgroundColor),
+                glow: .clear,
+                glowSecondary: .clear,
+                panel: Color(nsColor: .controlBackgroundColor),
+                panelBorder: Color(nsColor: .separatorColor).opacity(0.55),
+                inset: Color.primary.opacity(0.045),
+                text: Color(nsColor: .labelColor),
+                secondaryText: Color(nsColor: .secondaryLabelColor),
+                defaultAccent: Color.accentColor,
+                material: dark ? .hudWindow : .underWindowBackground
+            )
+        }
+    }
+}
+
+enum MainTab: Int, CaseIterable, Identifiable {
+    case connect = 0, keyboard = 1, trackpad = 2, clipboard = 3, appearance = 4, more = 5
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .connect: return "Connect"
+        case .keyboard: return "Keyboard"
+        case .trackpad: return "Trackpad"
+        case .clipboard: return "Clipboard"
+        case .appearance: return "Look"
+        case .more: return "More"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .connect: return "network"
+        case .keyboard: return "keyboard"
+        case .trackpad: return "hand.point.up.left"
+        case .clipboard: return "doc.on.clipboard"
+        case .appearance: return "paintbrush.fill"
+        case .more: return "ellipsis.circle"
+        }
+    }
+}
+
+private struct ThemePaletteKey: EnvironmentKey {
+    static let defaultValue: ThemePalette = ThemePreset.midnight.palette(for: .dark)
+}
+
+private struct LiquidGlassEnabledKey: EnvironmentKey {
+    static let defaultValue: Bool = true
+}
+
+extension EnvironmentValues {
+    var themePalette: ThemePalette {
+        get { self[ThemePaletteKey.self] }
+        set { self[ThemePaletteKey.self] = newValue }
+    }
+
+    var liquidGlassEnabled: Bool {
+        get { self[LiquidGlassEnabledKey.self] }
+        set { self[LiquidGlassEnabledKey.self] = newValue }
+    }
+}
+
 // MARK: - Hosting
 
 func makeMainContentView(model: AppModel) -> NSView {
@@ -267,13 +514,141 @@ func makeMainContentView(model: AppModel) -> NSView {
 // MARK: - Design tokens
 
 enum Theme {
-    /// Card fill: white on the light window background, a soft lift in dark mode.
-    static let card = Color(nsColor: NSColor(name: nil) { ap in
-        ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor(white: 1, alpha: 0.055) : NSColor.white
-    })
-    static let cardStroke = Color.primary.opacity(0.08)
-    static let well = Color.primary.opacity(0.045)
-    static let radius: CGFloat = 12
+    static let radius: CGFloat = 14
+    static let compactRadius: CGFloat = 10
+}
+
+struct AdaptiveGlass: ViewModifier {
+    let enabled: Bool
+    let tint: Color?
+    let radius: CGFloat
+    let material: Material
+
+    init(enabled: Bool, tint: Color? = nil, radius: CGFloat = Theme.radius, material: Material = .ultraThinMaterial) {
+        self.enabled = enabled
+        self.tint = tint
+        self.radius = radius
+        self.material = material
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            if #available(macOS 26.0, *) {
+                content.glassEffect(.regular.tint(tint ?? .clear),
+                                    in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            } else {
+                content.background(
+                    RoundedRectangle(cornerRadius: radius, style: .continuous).fill(material)
+                )
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func adaptiveGlass(enabled: Bool, tint: Color? = nil, radius: CGFloat = Theme.radius,
+                       material: Material = .ultraThinMaterial) -> some View {
+        modifier(AdaptiveGlass(enabled: enabled, tint: tint, radius: radius, material: material))
+    }
+}
+
+extension Color {
+    init(hex: String) {
+        let s = hex.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+        var value: UInt64 = 0
+        Scanner(string: s).scanHexInt64(&value)
+        let r = Double((value >> 16) & 0xFF) / 255.0
+        let g = Double((value >> 8) & 0xFF) / 255.0
+        let b = Double(value & 0xFF) / 255.0
+        self.init(.sRGB, red: r, green: g, blue: b, opacity: 1)
+    }
+}
+
+extension NSColor {
+    func hexString() -> String {
+        guard let c = usingColorSpace(.deviceRGB) else { return "#5E9BFF" }
+        return String(format: "#%02X%02X%02X", Int(c.redComponent * 255), Int(c.greenComponent * 255), Int(c.blueComponent * 255))
+    }
+}
+
+struct GlassMaterial: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    let radius: CGFloat
+    let behindWindow: Bool
+
+    init(material: NSVisualEffectView.Material, radius: CGFloat = 0, behindWindow: Bool = false) {
+        self.material = material
+        self.radius = radius
+        self.behindWindow = behindWindow
+    }
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = material
+        v.blendingMode = behindWindow ? .behindWindow : .withinWindow
+        v.state = .active
+        v.wantsLayer = true
+        v.layer?.cornerRadius = radius
+        v.layer?.masksToBounds = true
+        return v
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = behindWindow ? .behindWindow : .withinWindow
+        nsView.layer?.cornerRadius = radius
+    }
+}
+
+struct PanelBackground: View {
+    @Environment(\.themePalette) private var palette
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
+    var radius: CGFloat = Theme.radius
+
+    var body: some View {
+        ZStack {
+            if glassEnabled {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(Color.clear)
+                    .adaptiveGlass(enabled: true, tint: palette.panel.opacity(0.35),
+                                   radius: radius, material: .ultraThinMaterial)
+            }
+            RoundedRectangle(cornerRadius: radius, style: .continuous).fill(palette.panel)
+            if glassEnabled {
+                LinearGradient(colors: [Color.white.opacity(0.14), Color.white.opacity(0.02)],
+                               startPoint: .top, endPoint: .bottom)
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            }
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .strokeBorder(palette.panelBorder, lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(glassEnabled ? 0.16 : 0.06),
+                radius: glassEnabled ? 11 : 4, x: 0, y: glassEnabled ? 4 : 2)
+    }
+}
+
+struct AppBackground: View {
+    @Environment(\.themePalette) private var palette
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
+
+    var body: some View {
+        ZStack {
+            palette.background.ignoresSafeArea()
+            RadialGradient(colors: [palette.glow.opacity(0.36), palette.glowSecondary.opacity(0.20), Color.clear],
+                           center: .topTrailing, startRadius: 30, endRadius: 520)
+                .ignoresSafeArea()
+            if glassEnabled {
+                GlassMaterial(material: palette.material, radius: 0, behindWindow: true).ignoresSafeArea()
+                RadialGradient(colors: [palette.glow.opacity(0.22), palette.glowSecondary.opacity(0.12), Color.clear],
+                               center: .topTrailing, startRadius: 30, endRadius: 520)
+                    .ignoresSafeArea()
+            }
+        }
+        .allowsHitTesting(false)
+    }
 }
 
 extension LinkState {
@@ -293,22 +668,159 @@ struct MainView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                BridgeHeader(model: model)
-                ConnectionCard(model: model)
-                KeyboardCard(model: model)
-                ShortcutsCard(model: model)
-                TrackpadCard(model: model)
-                ClipboardCard(model: model)
-                PermissionsCard(model: model)
-                LogCard(model: model)
+        VStack(spacing: 0) {
+            HeroBar(model: model)
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+
+            TabStrip(selection: $model.selectedTab)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+
+            Group {
+                switch MainTab(rawValue: model.selectedTab) ?? .connect {
+                case .connect:
+                    ScrollView { ConnectionCard(model: model).padding(16) }
+                case .keyboard:
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            KeyboardCard(model: model)
+                            ShortcutsCard(model: model)
+                        }
+                        .padding(16)
+                    }
+                case .trackpad:
+                    ScrollView { TrackpadCard(model: model).padding(16) }
+                case .clipboard:
+                    ScrollView { ClipboardCard(model: model).padding(16) }
+                case .appearance:
+                    ScrollView { AppearanceCard(model: model).padding(16) }
+                case .more:
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            PermissionsCard(model: model)
+                            LogCard(model: model)
+                        }
+                        .padding(16)
+                    }
+                }
             }
-            .padding(20)
-            .frame(maxWidth: 720)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(AppBackground())
+        .environment(\.themePalette, model.palette)
+        .environment(\.liquidGlassEnabled, model.liquidGlassEnabled)
+        .accentColor(model.effectiveAccent)
+        .foregroundColor(model.palette.text)
+        .preferredColorScheme(model.appearance == .light ? .light : model.appearance == .dark ? .dark : nil)
+        .animation(.easeInOut(duration: 0.28), value: model.theme)
+        .animation(.easeInOut(duration: 0.28), value: model.appearance)
+        .animation(.easeInOut(duration: 0.22), value: model.systemAppearanceTick)
+        .animation(.easeInOut(duration: 0.22), value: model.customAccent)
+        .animation(.easeInOut(duration: 0.22), value: model.useCustomAccent)
+        .animation(.easeInOut(duration: 0.28), value: model.liquidGlassEnabled)
+    }
+}
+
+/// The one screen every user sees first: status, connect and the main action - no scrolling needed.
+struct HeroBar: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 6) {
+                DevicePill(symbol: "laptopcomputer", title: "This Mac", active: true)
+                LinkTrack(state: model.link, forwarding: model.forwarding, clipboard: model.clipActive)
+                    .frame(height: 26)
+                    .padding(.horizontal, 2)
+                DevicePill(symbol: "desktopcomputer", title: model.host.isEmpty ? "Windows PC" : model.host,
+                           active: model.connected)
+            }
+
+            HStack(spacing: 12) {
+                PulsingDot(color: model.statusColor, pulsing: model.link == .connecting, size: 7)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.statusText)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text(model.forwardHint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 6)
+                if model.linkWanted {
+                    Button("Disconnect", action: model.toggleConnection)
+                        .controlSize(.large)
+                }
+                Button(action: model.toggleForwarding) {
+                    Label(model.forwarding ? "Stop" : "Start Forwarding",
+                          systemImage: model.forwarding ? "stop.fill" : "play.fill")
+                }
+                .buttonStyle(ProminentButtonStyle(tint: model.forwarding ? .red : .accentColor))
+                .disabled(!model.canForward)
+                .frame(width: 168)
+                .help("Same as the emergency hotkey \(model.hotkey.display)")
+            }
+        }
+        .padding(14)
+        .background(PanelBackground())
+    }
+}
+
+struct DevicePill: View {
+    let symbol: String
+    let title: String
+    let active: Bool
+    @Environment(\.themePalette) private var palette
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: symbol).font(.system(size: 15, weight: .semibold))
+            Text(title).font(.subheadline.weight(.medium)).lineLimit(1)
+        }
+        .foregroundStyle(active ? Color.accentColor : palette.secondaryText)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Capsule().fill(active ? Color.accentColor.opacity(0.12) : palette.inset))
+        .adaptiveGlass(enabled: glassEnabled, tint: active ? Color.accentColor.opacity(0.14) : .clear,
+                       radius: 999, material: .thinMaterial)
+    }
+}
+
+struct TabStrip: View {
+    @Binding var selection: Int
+    @Environment(\.themePalette) private var palette
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(MainTab.allCases) { tab in
+                Button {
+                    selection = tab.rawValue
+                } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: tab.symbol).font(.system(size: 16, weight: .semibold))
+                        Text(tab.title).font(.system(size: 10, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(selection == tab.rawValue ? Color.accentColor.opacity(0.16) : Color.clear)
+                    )
+                    .adaptiveGlass(enabled: glassEnabled && selection == tab.rawValue,
+                                   tint: Color.accentColor.opacity(0.16),
+                                   radius: 10, material: .thinMaterial)
+                    .foregroundStyle(selection == tab.rawValue ? Color.accentColor : palette.secondaryText)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(tab.title)
+            }
+        }
     }
 }
 
@@ -354,10 +866,7 @@ extension Card where Accessory == EmptyView {
 
 struct CardBackground: View {
     var body: some View {
-        RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-            .fill(Theme.card)
-            .overlay(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).strokeBorder(Theme.cardStroke))
-            .shadow(color: Color.black.opacity(0.05), radius: 3, x: 0, y: 1)
+        PanelBackground()
     }
 }
 
@@ -446,6 +955,7 @@ struct SliderRow: View {
 struct StatusBadge: View {
     let text: String
     let color: Color
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
 
     var body: some View {
         HStack(spacing: 5) {
@@ -455,6 +965,8 @@ struct StatusBadge: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(Capsule().fill(color.opacity(0.13)))
+        .adaptiveGlass(enabled: glassEnabled, tint: color.opacity(0.16),
+                       radius: 999, material: .thinMaterial)
     }
 }
 
@@ -489,6 +1001,7 @@ struct ProminentButtonStyle: ButtonStyle {
         let configuration: ButtonStyleConfiguration
         let tint: Color
         @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.liquidGlassEnabled) private var glassEnabled
 
         var body: some View {
             configuration.label
@@ -496,10 +1009,23 @@ struct ProminentButtonStyle: ButtonStyle {
                 .foregroundColor(.white.opacity(isEnabled ? 1 : 0.85))
                 .frame(maxWidth: .infinity, minHeight: 38)
                 .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(isEnabled ? tint : Color.gray.opacity(0.45))
-                        .brightness(configuration.isPressed ? -0.08 : 0)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(isEnabled ? tint : Color.gray.opacity(0.45))
+                        if glassEnabled && isEnabled {
+                            LinearGradient(colors: [Color.white.opacity(0.26), Color.white.opacity(0.02)],
+                                           startPoint: .top, endPoint: .bottom)
+                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        }
+                    }
+                    .brightness(configuration.isPressed ? -0.08 : 0)
                 )
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.white.opacity(glassEnabled && isEnabled ? 0.28 : 0.10), lineWidth: 1))
+                .shadow(color: tint.opacity(glassEnabled && isEnabled ? 0.28 : 0.12),
+                        radius: glassEnabled && isEnabled ? 8 : 3, x: 0, y: 2)
+                .adaptiveGlass(enabled: glassEnabled && isEnabled,
+                               tint: tint.opacity(0.24), radius: 9, material: .thinMaterial)
                 .scaleEffect(configuration.isPressed ? 0.985 : 1)
                 .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
                 .contentShape(Rectangle())
@@ -607,21 +1133,22 @@ struct DeviceTile: View {
     let title: String
     let subtitle: String
     let lit: Bool
+    @Environment(\.themePalette) private var palette
 
     var body: some View {
         VStack(spacing: 6) {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(lit ? Color.accentColor.opacity(0.14) : Theme.well)
+                .fill(lit ? Color.accentColor.opacity(0.14) : palette.inset)
                 .frame(width: 68, height: 68)
                 .overlay(
                     Image(systemName: symbol)
                         .font(.system(size: 30, weight: .regular))
-                        .foregroundColor(lit ? .accentColor : .secondary)
+                        .foregroundColor(lit ? .accentColor : palette.secondaryText)
                 )
             Text(title).font(.subheadline.weight(.semibold))
             Text(subtitle)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(palette.secondaryText)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
@@ -645,6 +1172,7 @@ struct LinkTrack: View {
     let state: LinkState
     let forwarding: Bool
     let clipboard: Bool
+    @Environment(\.themePalette) private var palette
 
     private var color: Color {
         if forwarding { return .accentColor }
@@ -682,7 +1210,7 @@ struct LinkTrack: View {
                 LinkLine().stroke(color.opacity(state == .idle ? 0.5 : 1),
                                   style: StrokeStyle(lineWidth: 4, lineCap: .round, dash: dash, dashPhase: CGFloat(phase)))
                 Circle()
-                    .fill(Theme.card)
+                    .fill(palette.panel)
                     .overlay(Circle().fill(color.opacity(0.14)))
                     .overlay(Circle().strokeBorder(color.opacity(0.5), lineWidth: 1))
                     .frame(width: 28, height: 28)
@@ -702,29 +1230,241 @@ struct ActivityLight: View {
     let detail: String
     let active: Bool
     let available: Bool
+    @Environment(\.themePalette) private var palette
 
     var body: some View {
         HStack(spacing: 9) {
             Circle()
-                .fill(active ? Color.accentColor : Theme.well)
+                .fill(active ? Color.accentColor : palette.inset)
                 .frame(width: 30, height: 30)
                 .overlay(Image(systemName: symbol)
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(active ? .white : (available ? .accentColor : .secondary)))
+                    .foregroundColor(active ? .white : (available ? .accentColor : palette.secondaryText)))
                 .shadow(color: active ? Color.accentColor.opacity(0.45) : .clear, radius: active ? 5 : 0)
                 .scaleEffect(active ? 1.08 : 1)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.caption.weight(.semibold))
-                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                Text(detail).font(.caption2).foregroundStyle(palette.secondaryText).lineLimit(1)
             }
             Spacer(minLength: 0)
         }
         .padding(8)
         .frame(maxWidth: .infinity)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.well))
+        .background(RoundedRectangle(cornerRadius: Theme.compactRadius, style: .continuous).fill(palette.inset))
         .opacity(available || active ? 1 : 0.7)
         .animation(.easeOut(duration: 0.18), value: active)
         .animation(.easeInOut(duration: 0.25), value: available)
+    }
+}
+
+// MARK: - Appearance settings
+
+struct AppearanceCard: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.themePalette) private var palette
+
+    private let accentPresets = ["#5E9BFF", "#A78BFA", "#34C6D9", "#34D399", "#FB7185", "#F59E0B"]
+
+    var body: some View {
+        Card("Appearance", symbol: "paintbrush.fill", tint: palette.defaultAccent) {
+            VStack(alignment: .leading, spacing: 16) {
+                ThemePreview(model: model)
+
+                VStack(alignment: .leading, spacing: 9) {
+                    sectionTitle("Theme")
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 118), spacing: 10)], spacing: 10) {
+                        ForEach(ThemePreset.allCases) { preset in
+                            ThemeTile(preset: preset, appearance: model.resolvedAppearance,
+                                      selected: model.theme == preset) { model.theme = preset }
+                        }
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 9) {
+                    sectionTitle("Appearance")
+                    Picker("", selection: $model.appearance) {
+                        ForEach(AppearanceMode.allCases) { mode in
+                            Label(mode.title, systemImage: mode.symbol).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    sectionTitle("Material")
+                    Toggle(isOn: $model.liquidGlassEnabled) {
+                        HStack(spacing: 9) {
+                            Image(systemName: "sparkles").foregroundStyle(Color.accentColor)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Liquid Glass")
+                                Text("Frosted panels over the theme colour")
+                                    .font(.caption)
+                                    .foregroundStyle(palette.secondaryText)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    sectionTitle("Accent")
+                    Toggle("Use custom accent", isOn: $model.useCustomAccent)
+                    if model.useCustomAccent {
+                        HStack(spacing: 12) {
+                            ColorPicker("Colour", selection: Binding(
+                                get: { Color(hex: model.customAccent) },
+                                set: { model.customAccent = NSColor($0).hexString() }
+                            ))
+                            HStack(spacing: 7) {
+                                ForEach(accentPresets, id: \.self) { hex in
+                                    AccentSwatch(color: Color(hex: hex),
+                                                 selected: model.customAccent.lowercased() == hex.lowercased()) {
+                                        model.customAccent = hex
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text("Changes are saved automatically.")
+                    .font(.caption)
+                    .foregroundStyle(palette.secondaryText)
+            }
+        }
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text).font(.subheadline.weight(.semibold))
+    }
+}
+
+struct ThemePreview: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.themePalette) private var palette
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("Live preview").font(.caption.weight(.semibold)).foregroundStyle(palette.secondaryText)
+                Spacer()
+                if glassEnabled {
+                    Image(systemName: "sparkles").font(.caption).foregroundStyle(Color.accentColor)
+                }
+                Text(model.theme.title).font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor)
+            }
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(palette.background)
+                RadialGradient(colors: [palette.glow.opacity(0.40), Color.clear],
+                               center: .topTrailing, startRadius: 4, endRadius: 150)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                if glassEnabled {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.clear)
+                        .adaptiveGlass(enabled: true, tint: palette.panel.opacity(0.28),
+                                       radius: 12, material: .ultraThinMaterial)
+                }
+
+                VStack(spacing: 10) {
+                    HStack(spacing: 7) {
+                        Circle().fill(Color.accentColor).frame(width: 7, height: 7)
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(palette.secondaryText.opacity(0.45))
+                            .frame(width: 74, height: 6)
+                        Spacer()
+                        Capsule().fill(Color.accentColor.opacity(0.16)).frame(width: 48, height: 15)
+                    }
+                    HStack(spacing: 9) {
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(palette.panel)
+                            .frame(height: 42)
+                            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(palette.panelBorder, lineWidth: 1))
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color.accentColor)
+                            .frame(width: 82, height: 42)
+                            .overlay(Text("Connect").font(.caption.weight(.semibold)).foregroundColor(.white))
+                    }
+                }
+                .padding(14)
+            }
+            .frame(height: 116)
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(palette.panelBorder))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+}
+
+struct ThemeTile: View {
+    let preset: ThemePreset
+    let appearance: ThemeAppearance
+    let selected: Bool
+    let action: () -> Void
+    @Environment(\.themePalette) private var palette
+    @Environment(\.liquidGlassEnabled) private var glassEnabled
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                ZStack(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous).fill(previewPalette.background)
+                    RadialGradient(colors: [previewPalette.glow.opacity(0.55), Color.clear],
+                                   center: .topTrailing, startRadius: 2, endRadius: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    VStack(alignment: .leading, spacing: 5) {
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(previewPalette.panel)
+                            .frame(height: 18)
+                        HStack(spacing: 4) {
+                            Capsule().fill(previewPalette.defaultAccent).frame(width: 20, height: 5)
+                            Capsule().fill(previewPalette.secondaryText.opacity(0.45)).frame(width: 28, height: 5)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.top, 10)
+                }
+                .frame(height: 50)
+                .adaptiveGlass(enabled: glassEnabled && selected,
+                               tint: previewPalette.panel.opacity(0.22), radius: 9, material: .thinMaterial)
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor : palette.panelBorder, lineWidth: selected ? 2 : 1))
+                Text(preset.title).font(.caption.weight(.medium))
+                    .foregroundStyle(selected ? Color.accentColor : palette.secondaryText)
+                    .lineLimit(1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(preset.subtitle)
+    }
+
+    private var previewPalette: ThemePalette {
+        preset.palette(for: appearance)
+    }
+}
+
+struct AccentSwatch: View {
+    let color: Color
+    let selected: Bool
+    let action: () -> Void
+    @Environment(\.themePalette) private var palette
+
+    var body: some View {
+        Button(action: action) {
+            Circle()
+                .fill(color)
+                .frame(width: 18, height: 18)
+                .overlay(Circle().strokeBorder(selected ? palette.text : Color.clear, lineWidth: 2))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -925,6 +1665,7 @@ struct HintLine: View {
 
 struct KeyCaps: View {
     let hotkey: Hotkey
+    @Environment(\.themePalette) private var palette
 
     private var caps: [String] {
         var c: [String] = []
@@ -945,10 +1686,10 @@ struct KeyCaps: View {
                     .padding(.horizontal, cap.count > 1 ? 5 : 0)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(Theme.card)
+                            .fill(palette.panel)
                             .shadow(color: Color.black.opacity(0.18), radius: 0, x: 0, y: 1)
                     )
-                    .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Theme.cardStroke))
+                    .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(palette.panelBorder))
             }
         }
     }
@@ -1063,6 +1804,7 @@ struct ClipboardCard: View {
 struct LastTransferRow: View {
     let transfer: ClipTransfer?
     let active: Bool
+    @Environment(\.themePalette) private var palette
 
     private static let timeFormat: DateFormatter = {
         let f = DateFormatter()
@@ -1094,7 +1836,7 @@ struct LastTransferRow: View {
             Spacer()
         }
         .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.well))
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(palette.inset))
         .animation(.easeInOut(duration: 0.25), value: transfer)
         .animation(.spring(response: 0.3, dampingFraction: 0.6), value: active)
     }
@@ -1164,6 +1906,7 @@ struct PermissionRow: View {
 struct LogCard: View {
     @ObservedObject var model: AppModel
     @AppStorage("logExpanded") private var expanded = false
+    @Environment(\.themePalette) private var palette
 
     private static let timeFormat: DateFormatter = {
         let f = DateFormatter()
@@ -1208,7 +1951,7 @@ struct LogCard: View {
                         .textSelection(.enabled)
                     }
                     .frame(height: 170)
-                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.well))
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(palette.inset))
                     .onAppear { if let last = model.log.last { proxy.scrollTo(last.id, anchor: .bottom) } }
                     .onChange(of: model.log.last?.id) { id in
                         if let id = id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .bottom) } }
