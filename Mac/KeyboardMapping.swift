@@ -24,6 +24,8 @@ private let mkRightCommand: UInt16 = 54
 private let mkLeftControl: UInt16 = 59
 private let mkRightControl: UInt16 = 62
 private let mkLeftOption: UInt16 = 58
+private let mkRightOption: UInt16 = 61
+private let mkWin: UInt16 = 54
 private let mkKeyZ: UInt16 = 6
 private let mkKeyY: UInt16 = 16
 private let mkKeyQ: UInt16 = 12
@@ -43,6 +45,7 @@ final class KeyboardMapper {
     private var wireSources: [UInt16: Int] = [:]
     private var bindings: [UInt16: [UInt16]] = [:]
     private var consumed = Set<UInt16>()
+    private var cmdUsed = Set<UInt16>()
 
     init(options: ShortcutMappingOptions = ShortcutMappingOptions()) {
         self.options = options
@@ -53,13 +56,14 @@ final class KeyboardMapper {
         wireSources.removeAll()
         bindings.removeAll()
         consumed.removeAll()
+        cmdUsed.removeAll()
     }
 
     func isModifier(_ code: UInt16) -> Bool { mkModifierCodes.contains(code) }
 
     var commandHeld: Bool { physical.contains(mkLeftCommand) || physical.contains(mkRightCommand) }
     var shiftHeld: Bool { physical.contains(56) || physical.contains(60) }
-    var optionHeld: Bool { physical.contains(mkLeftOption) || physical.contains(61) }
+    var optionHeld: Bool { physical.contains(mkLeftOption) || physical.contains(mkRightOption) }
     var controlHeld: Bool { physical.contains(mkLeftControl) || physical.contains(mkRightControl) }
 
     func modifierDown(_ code: UInt16) -> [WireKeyEvent] {
@@ -69,7 +73,13 @@ final class KeyboardMapper {
 
     func modifierUp(_ code: UInt16) -> KeyEventPlan {
         guard isModifier(code), physical.remove(code) != nil else { return .leaveOnMac }
-        return .events(lift(wireCode(forModifier: code)))
+        var events = lift(wireCode(forModifier: code))
+        // A Command key that was never combined with another key is the Windows key, not Ctrl.
+        let wasUsed = cmdUsed.remove(code) != nil
+        if options.enabled && (code == mkLeftCommand || code == mkRightCommand) && !wasUsed {
+            events.append(contentsOf: [.down(code: mkWin, repeat: false), .up(code: mkWin)])
+        }
+        return .events(events)
     }
 
     func keyDown(_ code: UInt16, isRepeat: Bool) -> KeyEventPlan {
@@ -79,9 +89,22 @@ final class KeyboardMapper {
             let opt = optionHeld
             let ctrl = controlHeld
 
+            if consumed.contains(code) { return .events([]) }  // auto-repeat of a chord key
+
+            // Any key press means Command was used as a modifier, so it must not turn into a Windows key on release.
+            if cmd {
+                for c in [mkLeftCommand, mkRightCommand] where physical.contains(c) { cmdUsed.insert(c) }
+            }
+
             if cmd && opt && code == mkKeyEscape { return .leaveOnMac }
-            if cmd && code == mkKeySpace { return .leaveOnMac }
-            if cmd && code == mkKeyQ { return .leaveOnMac }
+            if cmd && !opt && code == mkKeySpace { return .leaveOnMac }
+            if cmd && !opt && code == mkKeyQ { return .leaveOnMac }
+
+            // Option+Command+key is the Windows-key hotkey layer: Win+E, Win+R, Win+L, Win+Tab, ...
+            if cmd && opt {
+                consumed.insert(code)
+                return .events(winChord(key: code, isRepeat: isRepeat))
+            }
 
             if cmd && options.cmdTabToAltTab && code == mkKeyTab {
                 consumed.insert(code)
@@ -142,6 +165,24 @@ final class KeyboardMapper {
         }
         wireSources[code] = n - 1
         return []
+    }
+
+    /// Lifts the currently held Command / Option translations, taps Win+key, then restores them. The Windows app
+    /// maps wire code 54 to VK_RWIN, so no protocol or Windows-side change is needed.
+    private func winChord(key: UInt16, isRepeat: Bool) -> [WireKeyEvent] {
+        var events: [WireKeyEvent] = []
+        var lifted: [UInt16] = []
+        for c in [mkLeftCommand, mkRightCommand, mkLeftOption, mkRightOption] where physical.contains(c) {
+            let wc = wireCode(forModifier: c)
+            events.append(.up(code: wc))
+            lifted.append(wc)
+        }
+        events.append(.down(code: mkWin, repeat: false))
+        events.append(.down(code: key, repeat: isRepeat))
+        events.append(.up(code: key))
+        events.append(.up(code: mkWin))
+        for wc in lifted { events.append(.down(code: wc, repeat: false)) }
+        return events
     }
 
     private func cmdTabChord() -> [WireKeyEvent] {

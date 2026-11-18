@@ -883,6 +883,11 @@ struct ShortcutsCard: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            VStack(alignment: .leading, spacing: 4) {
+                HintLine(symbol: "command", text: "Press ⌘ alone → Windows key. ⌘+letter → Ctrl+letter (copy, paste, undo ...).")
+                HintLine(symbol: "option", text: "⌥⌘+key → Windows key + key (⌥⌘E = Explorer, ⌥⌘R = Run, ⌥⌘L = Lock).")
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 SwitchRow(title: "Command → Control",
                           detail: "⌘C → Ctrl+C, ⌘V → Ctrl+V, ⌘A → Ctrl+A and other Cmd shortcuts.",
