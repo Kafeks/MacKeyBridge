@@ -64,9 +64,6 @@
 #include <unordered_map>
 #include <vector>
 
-// ==========================================================================
-// Util.h
-// ==========================================================================
 inline std::string narrow(const std::wstring& w) {
     if (w.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -83,10 +80,6 @@ inline std::wstring widen(const std::string& s) {
     return w;
 }
 
-
-// ==========================================================================
-// Log.h
-// ==========================================================================
 // Tiny thread-safe file logger: %APPDATA%\MacKeyBridge\log.txt (rotated at 1 MB).
 namespace Log {
 enum class Level { Debug, Info, Warn, Error };
@@ -110,10 +103,6 @@ void write(Level lvl, const char* fmt, ...)
 #define LOG_WARN(...)  Log::write(Log::Level::Warn, __VA_ARGS__)
 #define LOG_ERROR(...) Log::write(Log::Level::Error, __VA_ARGS__)
 
-
-// ==========================================================================
-// Protocol.h
-// ==========================================================================
 // Wire protocol between the macOS client and the Windows server (version 3; version 2 clients are still
 // accepted, they just get no clipboard sync). Mirrored by constants at the top of the macOS client (main.swift).
 //
@@ -191,10 +180,6 @@ inline size_t eventLength(uint8_t type) {
 }
 }  // namespace proto
 
-
-// ==========================================================================
-// Settings.h
-// ==========================================================================
 enum class SwitchMethod : int {
     Api = 0,        // WM_INPUTLANGCHANGEREQUEST to the foreground window (explicit target layout)
     WinSpace = 1,   // inject Win+Space (Windows cycles its own layout list)
@@ -253,10 +238,6 @@ private:
     std::wstring dir_, path_;
 };
 
-
-// ==========================================================================
-// KeyMapper.h
-// ==========================================================================
 // A physical Windows key. Injected by hardware scan code when `scan` != 0
 // (this is what games / DirectInput / RawInput expect and lets the active layout
 // decide the character), otherwise by virtual key.
@@ -297,10 +278,6 @@ public:
     static std::string winName(const WinKey& k);
 };
 
-
-// ==========================================================================
-// Injector.h
-// ==========================================================================
 // Thin SendInput wrapper. Keys are reference counted so several Mac keys can map to the
 // same Windows key (e.g. both Command keys -> Ctrl) without sending a premature key-up.
 // Not thread-safe: KeyboardManager serialises access.
@@ -344,10 +321,6 @@ private:
     bool dry_ = false;
 };
 
-
-// ==========================================================================
-// MacShortcuts.h
-// ==========================================================================
 // What the Mac modifiers look like at the moment a key goes down.
 struct ShortcutContext {
     bool cmd = false;    // a Command key that acts as Ctrl is held
@@ -378,10 +351,6 @@ public:
     static std::optional<ShortcutAction> find(uint16_t macKey, const ShortcutContext& ctx);
 };
 
-
-// ==========================================================================
-// LanguageManager.h
-// ==========================================================================
 class LanguageManager {
 public:
     struct Layout {
@@ -418,10 +387,6 @@ private:
     HKL lastForeign_ = nullptr;
 };
 
-
-// ==========================================================================
-// KeyboardManager.h
-// ==========================================================================
 // What the Keyboard Test window shows for each incoming Mac key event.
 struct TraceEvent {
     uint16_t macCode = 0;
@@ -470,10 +435,6 @@ private:
     std::function<void(const TraceEvent&)> trace_;
 };
 
-
-// ==========================================================================
-// NetworkServer.h
-// ==========================================================================
 class KeyboardManager;
 
 // TCP server: one MacBook client at a time, HMAC challenge-response authentication,
@@ -537,10 +498,6 @@ private:
     bool localClip_ = true;
 };
 
-
-// ==========================================================================
-// TrayIcon.h
-// ==========================================================================
 // System-tray icon that shows the active layout ("EN", "RU") on a coloured badge:
 // grey = disabled, blue = waiting for the MacBook, green = MacBook connected.
 class TrayIcon {
@@ -569,10 +526,6 @@ private:
     State lastState_ = State::Disabled;
 };
 
-
-// ==========================================================================
-// UI.h
-// ==========================================================================
 class LanguageManager;
 class KeyboardManager;
 class NetworkServer;
@@ -585,10 +538,6 @@ namespace UI {
 int run(HINSTANCE inst, LanguageManager& lang, KeyboardManager& kb, NetworkServer& net, bool showSettings);
 }  // namespace UI
 
-
-// ==========================================================================
-// Log.cpp
-// ==========================================================================
 namespace Log {
 namespace {
 std::mutex g_mu;
@@ -634,10 +583,6 @@ void write(Level lvl, const char* fmt, ...) {
 }
 }  // namespace Log
 
-
-// ==========================================================================
-// Settings.cpp
-// ==========================================================================
 namespace {
 
 std::wstring getStr(const std::wstring& path, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
@@ -801,10 +746,6 @@ void Settings::save(const Config& c) const {
     putStr(P, L"Startup", L"debug", b(c.debug));
 }
 
-
-// ==========================================================================
-// KeyMapper.cpp
-// ==========================================================================
 namespace {
 
 struct Entry {
@@ -981,10 +922,6 @@ std::string KeyMapper::winName(const WinKey& k) {
     return b;
 }
 
-
-// ==========================================================================
-// Injector.cpp
-// ==========================================================================
 namespace {
 constexpr ULONG_PTR kTag = 0x4D4B4231;  // "MKB1" in dwExtraInfo, marks our own events
 }
@@ -1156,10 +1093,6 @@ void Injector::releaseAll() {
     send(v);
 }
 
-
-// ==========================================================================
-// MacShortcuts.cpp
-// ==========================================================================
 namespace {
 
 constexpr uint8_t MM_CMD = 1, MM_OPT = 2, MM_CTRL = 4, MM_SHIFT = 8;  // Mac-side modifier mask
@@ -1225,10 +1158,6 @@ std::optional<ShortcutAction> MacShortcuts::find(uint16_t key, const ShortcutCon
     return std::nullopt;
 }
 
-
-// ==========================================================================
-// LanguageManager.cpp
-// ==========================================================================
 namespace {
 
 LANGID langOf(HKL h) { return (LANGID)((UINT_PTR)h & 0xFFFF); }
@@ -1346,10 +1275,6 @@ LanguageManager::Result LanguageManager::toggle(bool dryRun) {
     return r;
 }
 
-
-// ==========================================================================
-// KeyboardManager.cpp
-// ==========================================================================
 namespace {
 
 bool cmdIsCtrl(const Config& c) { return c.macMode && c.commandShortcuts; }
@@ -1655,10 +1580,6 @@ void KeyboardManager::handle(uint16_t code, bool down, bool repeat, const Config
     if (ctx.cmd) t.mapped = "Ctrl+" + KeyMapper::winName(wk) + "   (Cmd+" + t.physical + ")";
 }
 
-
-// ==========================================================================
-// NetworkServer.cpp
-// ==========================================================================
 namespace {
 
 bool hmacSha256(const std::string& key, const uint8_t* data, size_t len, uint8_t out[32]) {
@@ -2008,10 +1929,6 @@ bool NetworkServer::sendClipboard(uint8_t kind, const std::vector<uint8_t>& data
     return true;
 }
 
-
-// ==========================================================================
-// TrayIcon.cpp
-// ==========================================================================
 namespace {
 // Portable (MSVC + MinGW) bounded copy into the fixed szTip buffer.
 void setTip(NOTIFYICONDATAW& n, const std::wstring& t) {
@@ -2135,10 +2052,6 @@ void TrayIcon::remove() {
     }
 }
 
-
-// ==========================================================================
-// Clipboard.cpp
-// ==========================================================================
 // Windows side of the two-way clipboard sync (protocol 3): text (CF_UNICODETEXT <-> UTF-8 with LF line ends) and
 // images (the registered "PNG" format and CF_DIB <-> PNG bytes). PNG encoding / decoding uses WIC, which is part of
 // Windows; the WIC GUIDs are spelled out here so that no extra import library is needed (only ole32).
@@ -2489,10 +2402,6 @@ uint64_t hash(uint8_t kind, const std::vector<uint8_t>& data) {
 
 }  // namespace Clip
 
-
-// ==========================================================================
-// UI.cpp
-// ==========================================================================
 namespace {
 
 constexpr UINT WM_TRAY = WM_APP + 1;    // tray icon callback
@@ -2602,7 +2511,6 @@ HKL currentForeignLayout() {
     HKL h = S.lang->lastForeign();
     return h ? h : GetKeyboardLayout(0);
 }
-
 
 std::wstring clipStatusText() {
     auto c = Settings::instance().get();
@@ -3242,10 +3150,6 @@ int run(HINSTANCE inst, LanguageManager& lang, KeyboardManager& kb, NetworkServe
 
 }  // namespace UI
 
-
-// ==========================================================================
-// main.cpp
-// ==========================================================================
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     // Single instance: a second launch just asks the running one to show its settings.
