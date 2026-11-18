@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds MacKeyBridge.app from main.swift, Clipboard.swift and UI.swift (needs the Xcode command line tools: xcode-select --install).
+# Builds MacKeyBridge.app from main.swift, Clipboard.swift, KeyboardMapping.swift and UI.swift (needs the Xcode command line tools: xcode-select --install).
 # Usage:  chmod +x build-app.sh && ./build-app.sh
 set -e
 cd "$(dirname "$0")"
@@ -8,7 +8,7 @@ APP="MacKeyBridge.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
-swiftc -O main.swift Clipboard.swift UI.swift -o "$APP/Contents/MacOS/MacKeyBridge"
+swiftc -O main.swift Clipboard.swift KeyboardMapping.swift UI.swift -o "$APP/Contents/MacOS/MacKeyBridge"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

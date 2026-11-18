@@ -32,6 +32,20 @@ final class AppModel: ObservableObject {
     @Published private(set) var hotkey = prefs.hotkey
     @Published var recordingHotkey = false
 
+    // Keyboard shortcuts
+    @Published var shortcutMapping = prefs.shortcutMapping {
+        didSet { prefs.shortcutMapping = shortcutMapping; applyOptions() }
+    }
+    @Published var cmdToCtrl = prefs.cmdToCtrl {
+        didSet { prefs.cmdToCtrl = cmdToCtrl; applyOptions() }
+    }
+    @Published var cmdShiftZToCtrlY = prefs.cmdShiftZToCtrlY {
+        didSet { prefs.cmdShiftZToCtrlY = cmdShiftZToCtrlY; applyOptions() }
+    }
+    @Published var cmdTabToAltTab = prefs.cmdTabToAltTab {
+        didSet { prefs.cmdTabToAltTab = cmdTabToAltTab; applyOptions() }
+    }
+
     // Trackpad
     @Published var forwardMouse = prefs.forwardMouse {
         didSet { prefs.forwardMouse = forwardMouse; applyOptions() }
@@ -98,6 +112,12 @@ final class AppModel: ObservableObject {
         gFwd.mouse = MouseOptions(enabled: forwardMouse, pointerSpeed: pointerSpeed, scrollSpeed: scrollSpeed,
                                   invertV: invertV, invertH: invertH)
         gFwd.nav = NavOptions(enabled: swipeNav, threshold: swipeThreshold, output: swipeKeys, reverse: swipeReverse)
+        let keys = ShortcutMappingOptions(enabled: shortcutMapping, commandToControl: cmdToCtrl,
+                                          cmdShiftZToCtrlY: cmdShiftZToCtrlY, cmdTabToAltTab: cmdTabToAltTab)
+        if gFwd.shortcuts != keys {
+            gFwd.shortcuts = keys
+            gFwd.releaseMappedKeys()
+        }
         gFwd.updateMouseCapture()
         gClip.enabled = clipboardSync
         gClip.includeImages = clipboardImages
@@ -278,6 +298,7 @@ struct MainView: View {
                 BridgeHeader(model: model)
                 ConnectionCard(model: model)
                 KeyboardCard(model: model)
+                ShortcutsCard(model: model)
                 TrackpadCard(model: model)
                 ClipboardCard(model: model)
                 PermissionsCard(model: model)
@@ -845,6 +866,42 @@ struct KeyboardCard: View {
                 HintLine(symbol: "command", text: "Left ⌘ works as Ctrl, right ⌘ as the Windows key - change the key map in the Windows app.")
                 HintLine(symbol: "speaker.wave.2", text: "Volume and media keys are forwarded too; brightness stays on the Mac.")
             }
+        }
+    }
+}
+
+struct ShortcutsCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Card("Keyboard Shortcuts", symbol: "command", tint: .blue, accessory: {
+            Toggle("", isOn: $model.shortcutMapping).toggleStyle(.switch).labelsHidden()
+                .help("Translate macOS shortcuts before sending them to Windows")
+        }) {
+            Text("Shortcuts are converted on this Mac before they are sent to Windows.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 6) {
+                SwitchRow(title: "Command → Control",
+                          detail: "⌘C → Ctrl+C, ⌘V → Ctrl+V, ⌘A → Ctrl+A and other Cmd shortcuts.",
+                          isOn: $model.cmdToCtrl)
+                SwitchRow(title: "Command + Shift + Z → Ctrl + Y",
+                          detail: "Use the Windows redo shortcut for the macOS undo-redo gesture.",
+                          isOn: $model.cmdShiftZToCtrlY)
+                SwitchRow(title: "Command + Tab → Alt + Tab",
+                          detail: "Switch apps on Windows with the macOS app switcher gesture.",
+                          isOn: $model.cmdTabToAltTab)
+            }
+            .disabled(!model.shortcutMapping)
+            .opacity(model.shortcutMapping ? 1 : 0.5)
+            .animation(.easeInOut(duration: 0.2), value: model.shortcutMapping)
+
+            Label("⌘⇧Esc, ⌘Space and ⌘Q stay on this Mac; Caps Lock is never remapped.", systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

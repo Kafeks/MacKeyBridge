@@ -168,6 +168,22 @@ final class Prefs {
         get { (d.object(forKey: "clipboardImages") as? Bool) ?? true }
         set { d.set(newValue, forKey: "clipboardImages") }
     }
+    var shortcutMapping: Bool {
+        get { (d.object(forKey: "shortcutMapping") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "shortcutMapping") }
+    }
+    var cmdToCtrl: Bool {
+        get { (d.object(forKey: "cmdToCtrl") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "cmdToCtrl") }
+    }
+    var cmdShiftZToCtrlY: Bool {
+        get { (d.object(forKey: "cmdShiftZToCtrlY") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "cmdShiftZToCtrlY") }
+    }
+    var cmdTabToAltTab: Bool {
+        get { (d.object(forKey: "cmdTabToAltTab") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "cmdTabToAltTab") }
+    }
     /// Emergency hotkey. Falls back to Control+Option+Command+W if the stored value is missing or unsafe.
     var hotkey: Hotkey {
         get {
@@ -981,6 +997,8 @@ final class Forwarder {
     var onChange: (() -> Void)?
     var mouse = MouseOptions()   // main thread only (the main tap runs on the main thread)
     var nav = NavOptions()       // main thread only
+    var shortcuts = ShortcutMappingOptions()  // main thread only
+    private let mapper = KeyboardMapper()
     let capture = MouseCapture()
     let panic = PanicTap()
 
@@ -1284,6 +1302,7 @@ final class Forwarder {
             // an emergency stop on another thread and was sent after its ALL_UP: release it on the PC again.
             if !held.isEmpty { link.enqueue([pktAllUp, 0, 0, 0]) }
             held.reset()
+            mapper.reset()
             accX = 0; accY = 0; accSX = 0; accSY = 0
             swipe.reset()
         }
@@ -1313,33 +1332,55 @@ final class Forwarder {
         case .keyDown:
             let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
             let rep = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-            held.keyDown(code)
-            sendKey(pktKeyDown, code, repeatFlag: rep)
-            return nil
+            if mapper.isModifier(code) {
+                emit(mapper.modifierDown(code))
+                return nil
+            }
+            switch mapper.keyDown(code, isRepeat: rep) {
+            case .events(let events):
+                emit(events)
+                return nil
+            case .leaveOnMac:
+                return Unmanaged.passUnretained(event)  // Cmd+Space / Cmd+Q / Cmd+Option+Escape stay on the Mac
+            }
 
         case .keyUp:
             let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
-            if held.keyUp(code) {
-                sendKey(pktKeyUp, code)
+            let plan = mapper.isModifier(code) ? mapper.modifierUp(code) : mapper.keyUp(code)
+            switch plan {
+            case .events(let events):
+                emit(events)
                 return nil
+            case .leaveOnMac:
+                return Unmanaged.passUnretained(event)  // released a key that was not sent while forwarding
             }
-            return Unmanaged.passUnretained(event)  // pressed before forwarding started: the Mac needs to see the release
 
         case .flagsChanged:
             // Modifier keys (and Fn / Globe = key code 63) arrive as flagsChanged with their own key code.
             let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
             let raw = event.flags.rawValue
-            switch code {
-            case 63:  // Fn / Globe
-                return forwardModifier(code, down: (raw & CGEventFlags.maskSecondaryFn.rawValue) != 0, event)
-            case 57:  // Caps Lock reports state changes, not key presses: send one tap per event
+            if code == 57 {  // Caps Lock reports state changes, not key presses: send one tap per event
                 sendKey(pktKeyDown, code)
                 sendKey(pktKeyUp, code)
                 return nil
-            default:
-                if let m = deviceMask[code] { return forwardModifier(code, down: (raw & m) != 0, event) }
-                return nil
             }
+            let down: Bool
+            if code == 63 {
+                down = (raw & CGEventFlags.maskSecondaryFn.rawValue) != 0
+            } else if let m = deviceMask[code] {
+                down = (raw & m) != 0
+            } else {
+                down = false
+            }
+            if down {
+                emit(mapper.modifierDown(code))
+            } else {
+                switch mapper.modifierUp(code) {
+                case .events(let events): emit(events)
+                case .leaveOnMac: return Unmanaged.passUnretained(event)
+                }
+            }
+            return nil
 
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             guard mouse.enabled else { return Unmanaged.passUnretained(event) }
@@ -1389,17 +1430,23 @@ final class Forwarder {
         }
     }
 
-    private func forwardModifier(_ code: UInt16, down: Bool, _ event: CGEvent) -> Unmanaged<CGEvent>? {
-        if down {
-            held.keyDown(code)
-            sendKey(pktKeyDown, code)
-            return nil
+    /// Sends the events produced by the mapper. `held` mirrors exactly what went on the wire, so a key-up is never
+    /// sent for a key whose key-down was not forwarded (e.g. one pressed before forwarding started).
+    private func emit(_ events: [WireKeyEvent]) {
+        for e in events {
+            switch e {
+            case .down(let code, let isRepeat):
+                held.keyDown(code)
+                sendKey(pktKeyDown, code, repeatFlag: isRepeat)
+            case .up(let code):
+                if held.keyUp(code) { sendKey(pktKeyUp, code) }
+            }
         }
-        if held.keyUp(code) {
-            sendKey(pktKeyUp, code)
-            return nil
-        }
-        return Unmanaged.passUnretained(event)  // released a modifier that was pressed before forwarding started
+    }
+
+    /// Called when the shortcut settings change: release translated modifiers that Windows may still hold.
+    func releaseMappedKeys() {
+        emit(mapper.releaseAll())
     }
 
     /// Scrolling: a two-finger trackpad gesture is either a swipe (horizontal) or an ordinary scroll (vertical);
@@ -1574,7 +1621,50 @@ func runSelfTests() -> Int32 {
     h.reset()
     check("reset forgets everything", !h.modifiersHeld && h.keyUp(0) == false && h.buttonUp(1) == false)
 
-    // 13: clipboard frames (protocol 3).
+    // 13: shortcut mapping (built before the wire is written).
+    let down = { (c: UInt16) -> WireKeyEvent in .down(code: c, repeat: false) }
+    let up = { (c: UInt16) -> WireKeyEvent in .up(code: c) }
+    let map = KeyboardMapper()
+    check("Cmd+Z -> Ctrl+Z", map.modifierDown(55) == [down(59)] && map.keyDown(6, isRepeat: false) == .events([down(6)])
+          && map.keyUp(6) == .events([up(6)]) && map.modifierUp(55) == .events([up(59)]))
+    check("Shift keeps its semantics", map.modifierDown(56) == [down(56)] && map.modifierUp(56) == .events([up(56)]))
+    _ = map.modifierDown(55)
+    _ = map.modifierDown(56)
+    check("Cmd+Shift+Z -> Ctrl+Y", map.keyDown(6, isRepeat: false) == .events([down(16)])
+          && map.keyUp(6) == .events([up(16)]))
+    _ = map.modifierUp(56)
+    _ = map.modifierUp(55)
+    _ = map.modifierDown(55)
+    let tabPlan = map.keyDown(48, isRepeat: false)
+    check("Cmd+Tab emits an Alt+Tab chord", tabPlan == .events([up(59), down(58), down(48), up(48), up(58), down(59)])
+          && map.keyUp(48) == .events([]))
+    _ = map.modifierUp(55)
+    _ = map.modifierDown(55)
+    _ = map.modifierDown(58)
+    check("Cmd+Option+Escape stays on the Mac", map.keyDown(53, isRepeat: false) == .leaveOnMac)
+    check("Cmd+Space stays on the Mac", map.keyDown(49, isRepeat: false) == .leaveOnMac)
+    check("Cmd+Q stays on the Mac", map.keyDown(12, isRepeat: false) == .leaveOnMac)
+    _ = map.modifierUp(58)
+    _ = map.modifierUp(55)
+    check("duplicate key-down is not sent twice", map.keyDown(8, isRepeat: false) == .events([down(8)])
+          && map.keyDown(8, isRepeat: false) == .events([]) && map.keyUp(8) == .events([up(8)]))
+    check("key-up of a key never sent is ignored", map.keyUp(99) == .leaveOnMac)
+    _ = map.modifierDown(55)
+    _ = map.modifierDown(59)
+    check("two physical modifiers map to one Ctrl without early release", map.modifierDown(55) == []
+          && map.modifierUp(55) == .events([]) && map.modifierUp(59) == .events([up(59)]))
+    check("releaseAll lifts everything and resets", {
+        let m = KeyboardMapper()
+        _ = m.modifierDown(55)
+        _ = m.keyDown(8, isRepeat: false)
+        return m.releaseAll() == [up(8), up(59)] && m.modifierUp(55) == .leaveOnMac
+    }())
+    var off = ShortcutMappingOptions()
+    off.enabled = false
+    let raw = KeyboardMapper(options: off)
+    check("mapping off forwards raw keys", raw.modifierDown(55) == [down(55)] && raw.modifierUp(55) == .events([up(55)]))
+
+    // 14: clipboard frames (protocol 3).
     let text = Data("Привет, Windows!\nline 2".utf8)
     let pkt = clipboardPacket(kind: clipKindText, payload: text)
     check("clipboard packet header is 6 bytes", pkt.count == 6 + text.count && pkt[0] == pktClipboard && pkt[1] == clipKindText)
