@@ -132,6 +132,11 @@ struct PeerFrameParser {
 final class Prefs {
     private let d = UserDefaults.standard
 
+    private func number(forKey key: String, default fallback: Double) -> Double {
+        guard d.object(forKey: key) != nil else { return fallback }
+        return d.double(forKey: key)
+    }
+
     var host: String {
         get { d.string(forKey: "host") ?? "" }
         set { d.set(newValue, forKey: "host") }
@@ -237,15 +242,15 @@ final class Prefs {
         set { d.set(newValue, forKey: "diagnosticsEnabled") }
     }
     var heartbeatInterval: Double {
-        get { DiagnosticsConfig.clampInterval(d.double(forKey: "heartbeatInterval")) }
+        get { DiagnosticsConfig.clampInterval(number(forKey: "heartbeatInterval", default: 1.0)) }
         set { d.set(DiagnosticsConfig.clampInterval(newValue), forKey: "heartbeatInterval") }
     }
     var highLatencyThreshold: Double {
-        get { DiagnosticsConfig.clampLatency(d.double(forKey: "highLatencyThreshold")) }
+        get { DiagnosticsConfig.clampLatency(number(forKey: "highLatencyThreshold", default: 150.0)) }
         set { d.set(DiagnosticsConfig.clampLatency(newValue), forKey: "highLatencyThreshold") }
     }
     var packetLossWarning: Double {
-        get { DiagnosticsConfig.clampLoss(d.double(forKey: "packetLossWarning")) }
+        get { DiagnosticsConfig.clampLoss(number(forKey: "packetLossWarning", default: 10.0)) }
         set { d.set(DiagnosticsConfig.clampLoss(newValue), forKey: "packetLossWarning") }
     }
     var diagnosticLogging: Bool {
@@ -253,7 +258,7 @@ final class Prefs {
         set { d.set(newValue, forKey: "diagnosticLogging") }
     }
     var graphHistoryDuration: Double {
-        get { DiagnosticsConfig.clampDuration(d.double(forKey: "graphHistoryDuration")) }
+        get { DiagnosticsConfig.clampDuration(number(forKey: "graphHistoryDuration", default: 60.0)) }
         set { d.set(DiagnosticsConfig.clampDuration(newValue), forKey: "graphHistoryDuration") }
     }
     /// Emergency hotkey. Falls back to Control+Option+Command+W if the stored value is missing or unsafe.

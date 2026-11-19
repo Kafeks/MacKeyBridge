@@ -2143,6 +2143,22 @@ struct NetworkPerformanceCard: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+            if !model.diagnosticsEnabled {
+                Label("Network diagnostics is off. Enable it in Diagnostics Settings.",
+                      systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if snapshot.connected && snapshot.protocolVersion < 4 {
+                Label("Latency metrics require protocol 4. Rebuild and run the Windows app to enable them.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if !snapshot.connected {
+                Label("Connect to Windows to collect latency measurements.",
+                      systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
