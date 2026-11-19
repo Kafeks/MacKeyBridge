@@ -104,6 +104,8 @@ final class ClipboardSync {
                 onUpdate?()
             case .clipboard(let kind, let data):
                 apply(kind: kind, data: data)
+            case .ping(_, _), .hostInfo(_):
+                break
             }
         }
     }

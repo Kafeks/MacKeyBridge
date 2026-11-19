@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import SystemConfiguration
+import UniformTypeIdentifiers
 
 // MARK: - Window model
 //
@@ -66,6 +67,27 @@ final class AppModel: ObservableObject {
     @Published var selectedTab = min(max(prefs.selectedTab, 0), MainTab.allCases.count - 1) {
         didSet { prefs.selectedTab = selectedTab }
     }
+
+    // Network diagnostics
+    @Published var diagnosticsEnabled = prefs.diagnosticsEnabled {
+        didSet { prefs.diagnosticsEnabled = diagnosticsEnabled; applyOptions() }
+    }
+    @Published var heartbeatInterval = prefs.heartbeatInterval {
+        didSet { prefs.heartbeatInterval = heartbeatInterval; applyOptions() }
+    }
+    @Published var highLatencyThreshold = prefs.highLatencyThreshold {
+        didSet { prefs.highLatencyThreshold = highLatencyThreshold; applyOptions() }
+    }
+    @Published var packetLossWarning = prefs.packetLossWarning {
+        didSet { prefs.packetLossWarning = packetLossWarning; applyOptions() }
+    }
+    @Published var diagnosticLogging = prefs.diagnosticLogging {
+        didSet { prefs.diagnosticLogging = diagnosticLogging; applyOptions() }
+    }
+    @Published var graphHistoryDuration = prefs.graphHistoryDuration {
+        didSet { prefs.graphHistoryDuration = graphHistoryDuration; applyOptions() }
+    }
+    @Published private(set) var netSnapshot = gNetDiag.snapshot()
 
     var resolvedAppearance: ThemeAppearance {
         switch appearance {
@@ -144,7 +166,7 @@ final class AppModel: ObservableObject {
     }
 
     func applyOptions() {
-        guard gFwd != nil, gClip != nil else { return }
+        guard gLink != nil, gFwd != nil, gClip != nil else { return }
         gFwd.mouse = MouseOptions(enabled: forwardMouse, pointerSpeed: pointerSpeed, scrollSpeed: scrollSpeed,
                                   invertV: invertV, invertH: invertH)
         gFwd.nav = NavOptions(enabled: swipeNav, threshold: swipeThreshold, output: swipeKeys, reverse: swipeReverse)
@@ -157,6 +179,18 @@ final class AppModel: ObservableObject {
         gFwd.updateMouseCapture()
         gClip.enabled = clipboardSync
         gClip.includeImages = clipboardImages
+        gNetDiag.updateConfig(diagnosticsConfig)
+    }
+
+    private var diagnosticsConfig: DiagnosticsConfig {
+        var c = DiagnosticsConfig()
+        c.enabled = diagnosticsEnabled
+        c.heartbeatInterval = heartbeatInterval
+        c.highLatencyMs = highLatencyThreshold
+        c.lossWarningPct = packetLossWarning
+        c.loggingEnabled = diagnosticLogging
+        c.graphDuration = graphHistoryDuration
+        return c
     }
 
     private func update<T: Equatable>(_ kp: ReferenceWritableKeyPath<AppModel, T>, _ v: T) {
@@ -172,6 +206,7 @@ final class AppModel: ObservableObject {
         update(\.ready, gFwd.ready)
         update(\.hotkey, gFwd.hotkey)
         update(\.remoteClipboard, gClip.peerSupportsClipboard ? gClip.remoteEnabled : nil)
+        update(\.netSnapshot, gNetDiag.snapshot())
         update(\.axGranted, AXIsProcessTrusted())
         update(\.imGranted, CGPreflightListenEventAccess())
         if link == .connected || link == .connecting { update(\.inputError, nil) }
@@ -199,6 +234,24 @@ final class AppModel: ObservableObject {
     }
 
     func clearLog() { log.removeAll() }
+
+    func clearDiagnosticLog() {
+        gNetDiag.clearLog()
+        netSnapshot = gNetDiag.snapshot()
+    }
+
+    func exportDiagnostics() {
+        let text = gNetDiag.exportText()
+        let panel = NSSavePanel()
+        panel.title = "Export Network Diagnostics"
+        panel.nameFieldStringValue = "MacKeyBridge-Diagnostics.txt"
+        panel.allowedContentTypes = [UTType.plainText]
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
 
     func copyLog() {
         let f = DateFormatter()
@@ -461,7 +514,7 @@ enum ThemePreset: Int, CaseIterable, Identifiable, Hashable {
 }
 
 enum MainTab: Int, CaseIterable, Identifiable {
-    case connect = 0, keyboard = 1, trackpad = 2, clipboard = 3, appearance = 4, more = 5
+    case connect = 0, keyboard = 1, trackpad = 2, clipboard = 3, appearance = 4, more = 5, diagnostics = 6
     var id: Int { rawValue }
     var title: String {
         switch self {
@@ -471,6 +524,7 @@ enum MainTab: Int, CaseIterable, Identifiable {
         case .clipboard: return "Clipboard"
         case .appearance: return "Look"
         case .more: return "More"
+        case .diagnostics: return "Diagnostics"
         }
     }
     var symbol: String {
@@ -481,6 +535,7 @@ enum MainTab: Int, CaseIterable, Identifiable {
         case .clipboard: return "doc.on.clipboard"
         case .appearance: return "paintbrush.fill"
         case .more: return "ellipsis.circle"
+        case .diagnostics: return "waveform.path.ecg"
         }
     }
 }
@@ -701,6 +756,17 @@ struct MainView: View {
                         VStack(spacing: 12) {
                             PermissionsCard(model: model)
                             LogCard(model: model)
+                        }
+                        .padding(16)
+                    }
+                case .diagnostics:
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            NetworkOverviewCard(model: model)
+                            NetworkPerformanceCard(model: model)
+                            NetworkDetailsCard(model: model)
+                            DiagnosticLogCard(model: model)
+                            DiagnosticsSettingsCard(model: model)
                         }
                         .padding(16)
                     }
@@ -1908,7 +1974,7 @@ struct LogCard: View {
     @AppStorage("logExpanded") private var expanded = false
     @Environment(\.themePalette) private var palette
 
-    private static let timeFormat: DateFormatter = {
+    static let timeFormat: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         return f
@@ -1953,8 +2019,8 @@ struct LogCard: View {
                     .frame(height: 170)
                     .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(palette.inset))
                     .onAppear { if let last = model.log.last { proxy.scrollTo(last.id, anchor: .bottom) } }
-                    .onChange(of: model.log.last?.id) { id in
-                        if let id = id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .bottom) } }
+                    .onReceive(model.$log) { lines in
+                        if let id = lines.last?.id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .bottom) } }
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -1965,6 +2031,330 @@ struct LogCard: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
+        }
+    }
+}
+
+private func diagnosticMs(_ value: Double?) -> String {
+    guard let value = value, value.isFinite else { return "—" }
+    return value < 10 ? String(format: "%.1f ms", value) : String(format: "%.0f ms", value)
+}
+
+private func diagnosticLoss(_ snapshot: NetworkSnapshot) -> String {
+    guard snapshot.heartbeatSent > 0 else { return "—" }
+    return String(format: "%.1f%%", snapshot.lossPct)
+}
+
+private func diagnosticDuration(_ value: TimeInterval) -> String {
+    guard value > 0 else { return "0s" }
+    let m = Int(value) / 60
+    let s = Int(value) % 60
+    return m == 0 ? "\(s)s" : "\(m)m \(s)s"
+}
+
+private func diagnosticAgo(_ date: Date?) -> String {
+    guard let date = date else { return "Never" }
+    let d = max(0, Date().timeIntervalSince(date))
+    if d < 2 { return "Just now" }
+    if d < 60 { return "\(Int(d))s ago" }
+    return "\(Int(d) / 60)m ago"
+}
+
+private func qualityColor(_ quality: ConnectionQuality) -> Color {
+    switch quality {
+    case .excellent, .good: return .green
+    case .fair: return .yellow
+    case .poor: return .orange
+    case .unstable, .disconnected: return .red
+    }
+}
+
+struct MetricTile: View {
+    let title: String
+    let value: String
+    let color: Color
+    @Environment(\.themePalette) private var palette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption).foregroundStyle(palette.secondaryText)
+            Text(value).font(.system(size: 19, weight: .semibold, design: .rounded)).foregroundColor(color)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inset))
+        .adaptiveGlass(enabled: true, tint: color.opacity(0.08), radius: 10, material: .thinMaterial)
+    }
+}
+
+struct NetworkOverviewCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let snapshot = model.netSnapshot
+        Card("Connection Overview", symbol: "network", tint: .blue, accessory: {
+            StatusBadge(text: snapshot.status, color: snapshot.connected ? .green : .orange)
+        }) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                MetricTile(title: "Current latency", value: diagnosticMs(snapshot.latencyMs),
+                           color: snapshot.latencyMs.map { $0 > snapshot.config.highLatencyMs ? .orange : .green } ?? .secondary)
+                MetricTile(title: "Connection quality", value: snapshot.quality.rawValue,
+                           color: qualityColor(snapshot.quality))
+                MetricTile(title: "Uptime", value: diagnosticDuration(snapshot.uptime), color: .primary)
+                MetricTile(title: "Heartbeat loss", value: diagnosticLoss(snapshot),
+                           color: snapshot.heartbeatSent > 0 && snapshot.lossPct >= snapshot.config.lossWarningPct
+                                ? .orange : .green)
+            }
+            if !model.diagnosticsEnabled {
+                Label("Network diagnostics is off. The connection keepalive still runs every second.",
+                      systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if snapshot.connected && snapshot.protocolVersion < 4 {
+                Label("Heartbeat metrics require protocol 4. Update the Windows app for full diagnostics.",
+                      systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct NetworkPerformanceCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let snapshot = model.netSnapshot
+        Card("Performance", symbol: "waveform.path.ecg", tint: .purple) {
+            LatencyGraph(samples: snapshot.samples, now: snapshot.now,
+                         duration: snapshot.config.graphDuration, threshold: snapshot.config.highLatencyMs)
+                .frame(height: 150)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                MetricTile(title: "Average", value: diagnosticMs(snapshot.averageMs), color: .primary)
+                MetricTile(title: "Min / Max", value: "\(diagnosticMs(snapshot.minimumMs)) / \(diagnosticMs(snapshot.maximumMs))",
+                           color: .primary)
+                MetricTile(title: "Jitter", value: diagnosticMs(snapshot.jitterMs), color: .primary)
+            }
+            HStack(spacing: 10) {
+                Text("Frames sent \(snapshot.packetsSent)")
+                Text("·")
+                Text("Frames received \(snapshot.packetsReceived)")
+                Spacer()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct NetworkDetailsCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let snapshot = model.netSnapshot
+        Card("Network Details", symbol: "info.circle", tint: .teal) {
+            SettingRow("Windows device") { Text(snapshot.peerHostname ?? "Not announced").foregroundStyle(.secondary) }
+            SettingRow("IP address") { Text(snapshot.peerIP.isEmpty ? "—" : snapshot.peerIP).foregroundStyle(.secondary) }
+            SettingRow("Protocol") {
+                Text(snapshot.protocolVersion == 0 ? "—" : "v\(snapshot.protocolVersion)").foregroundStyle(.secondary)
+            }
+            SettingRow("Connection duration") { Text(diagnosticDuration(snapshot.uptime)).foregroundStyle(.secondary) }
+            SettingRow("Last heartbeat") { Text(diagnosticAgo(snapshot.lastResponseDate)).foregroundStyle(.secondary) }
+            SettingRow("Reconnections") { Text("\(snapshot.reconnectionCount)").foregroundStyle(.secondary) }
+        }
+    }
+}
+
+struct DiagnosticLogCard: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.themePalette) private var palette
+
+    private static let timeFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    private func levelColor(_ level: DiagnosticLevel) -> Color {
+        switch level {
+        case .debug: return .secondary
+        case .info: return .blue
+        case .warning: return .orange
+        case .error: return .red
+        }
+    }
+
+    var body: some View {
+        Card("Diagnostics Logs", symbol: "text.badge.checkmark", tint: .orange, accessory: {
+            HStack(spacing: 4) {
+                Button(action: model.exportDiagnostics) { Image(systemName: "square.and.arrow.up") }
+                    .buttonStyle(.borderless).help("Export diagnostics as a text file")
+                Button(action: model.clearDiagnosticLog) { Image(systemName: "trash") }
+                    .buttonStyle(.borderless).help("Clear diagnostics logs")
+            }
+        }) {
+            if !model.diagnosticLogging {
+                Text("Diagnostic logging is off.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                let events = Array(model.netSnapshot.events.suffix(12).reversed())
+                if events.isEmpty {
+                    Text("No diagnostic events yet.").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(events) { event in
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text(LogCard.timeFormat.string(from: event.time)).foregroundStyle(.tertiary)
+                                Text(event.level.rawValue).foregroundColor(levelColor(event.level))
+                                Text(event.message).fixedSize(horizontal: false, vertical: true)
+                            }
+                            .font(.system(size: 10, design: .monospaced))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(9)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(palette.inset))
+                    .textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
+struct DiagnosticsSettingsCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Card("Diagnostics Settings", symbol: "gearshape", tint: .gray) {
+            SwitchRow(title: "Enable Network Diagnostics", detail: "Measures RTT, jitter and heartbeat delivery on the existing connection.",
+                      isOn: $model.diagnosticsEnabled)
+            SwitchRow(title: "Enable Diagnostic Logging", detail: "Records connection events without input or clipboard contents.",
+                      isOn: $model.diagnosticLogging)
+            Divider()
+            SliderRow(title: "Heartbeat interval", value: $model.heartbeatInterval, range: 0.25...2.0) {
+                String(format: "%.2f s", $0)
+            }
+            SliderRow(title: "High latency", value: $model.highLatencyThreshold, range: 20...1000) {
+                String(format: "%.0f ms", $0)
+            }
+            SliderRow(title: "Loss warning", value: $model.packetLossWarning, range: 1...50) {
+                String(format: "%.0f%%", $0)
+            }
+            SliderRow(title: "Graph history", value: $model.graphHistoryDuration, range: 30...300) {
+                String(format: "%.0f s", $0)
+            }
+            Label("Heartbeat loss measures diagnostic replies only. TCP still handles reliable delivery for input events.",
+                  systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+struct LatencyGraph: View {
+    struct Point: Identifiable {
+        let id: Int
+        let position: CGPoint
+        let high: Bool
+    }
+
+    struct Segment: Identifiable {
+        let id: Int
+        let points: [Point]
+        let high: Bool
+    }
+
+    let samples: [LatencySample]
+    let now: TimeInterval
+    let duration: TimeInterval
+    let threshold: Double
+    @Environment(\.themePalette) private var palette
+
+    private var upperBound: Double {
+        let peak = samples.compactMap { $0.rttMs }.max() ?? 0
+        return max(40, threshold * 1.4, peak * 1.15)
+    }
+
+    private func segments(size: CGSize) -> [Segment] {
+        let start = now - duration
+        var result: [Segment] = []
+        var current: [Point] = []
+        for (index, sample) in samples.enumerated() {
+            guard sample.time >= start else { continue }
+            guard let rtt = sample.rttMs else {
+                if current.count > 1 {
+                    result.append(Segment(id: result.count, points: current, high: current.contains { $0.high }))
+                }
+                current = []
+                continue
+            }
+            let x = CGFloat((sample.time - start) / duration) * size.width
+            let y = size.height - CGFloat(rtt / upperBound) * size.height
+            current.append(Point(id: index, position: CGPoint(x: x, y: y), high: sample.high))
+        }
+        if current.count > 1 {
+            result.append(Segment(id: result.count, points: current, high: current.contains { $0.high }))
+        }
+        return result
+    }
+
+    private func smoothPath(_ points: [Point]) -> Path {
+        var path = Path()
+        guard let first = points.first else { return path }
+        path.move(to: first.position)
+        if points.count == 2 {
+            path.addLine(to: points[1].position)
+            return path
+        }
+        var i = 1
+        while i < points.count - 1 {
+            let control = points[i].position
+            let next = points[i + 1].position
+            let mid = CGPoint(x: (control.x + next.x) / 2, y: (control.y + next.y) / 2)
+            path.addQuadCurve(to: mid, control: control)
+            i += 1
+        }
+        path.addLine(to: points[points.count - 1].position)
+        return path
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let size = geo.size
+            let graphSegments = segments(size: size)
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inset)
+                ForEach(1..<4) { i in
+                    let y = size.height * CGFloat(i) / 4
+                    Path { path in
+                        path.move(to: CGPoint(x: 0, y: y))
+                        path.addLine(to: CGPoint(x: size.width, y: y))
+                    }
+                    .stroke(palette.panelBorder, lineWidth: 0.5)
+                }
+                let thresholdY = size.height - CGFloat(threshold / upperBound) * size.height
+                Path { path in
+                    path.move(to: CGPoint(x: 0, y: thresholdY))
+                    path.addLine(to: CGPoint(x: size.width, y: thresholdY))
+                }
+                .stroke(Color.orange.opacity(0.35), style: StrokeStyle(lineWidth: 1, lineCap: .butt, dash: [4, 4]))
+                ForEach(graphSegments) { segment in
+                    smoothPath(segment.points)
+                        .stroke(segment.high ? Color.orange : Color.accentColor,
+                                style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                }
+                ForEach(graphSegments.flatMap { $0.points.filter { $0.high } }) { point in
+                    Circle().fill(Color.orange).frame(width: 4, height: 4)
+                        .position(point.position)
+                }
+                if graphSegments.isEmpty {
+                    Text("Waiting for latency measurements…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 }

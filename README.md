@@ -7,7 +7,7 @@ Two small programs:
 | Part | Files | Language |
 |---|---|---|
 | Windows server (tray app) | [`Windows/MacKeyBridge.cpp`](Windows/MacKeyBridge.cpp) | C++20, Win32 API only (+ WIC for clipboard images) |
-| macOS client (window + menu bar item) | [`Mac/main.swift`](Mac/main.swift) (engine), [`Mac/Clipboard.swift`](Mac/Clipboard.swift) (clipboard sync), [`Mac/UI.swift`](Mac/UI.swift) (SwiftUI window), [`Mac/build-app.sh`](Mac/build-app.sh) | Swift, AppKit + SwiftUI |
+| macOS client (window + menu bar item) | [`Mac/main.swift`](Mac/main.swift) (engine), [`Mac/Clipboard.swift`](Mac/Clipboard.swift) (clipboard sync), [`Mac/Diagnostics.swift`](Mac/Diagnostics.swift) (network metrics), [`Mac/UI.swift`](Mac/UI.swift) (SwiftUI window), [`Mac/build-app.sh`](Mac/build-app.sh) | Swift, AppKit + SwiftUI |
 
 ```
 MacBook keyboard/trackpad --> macOS client --(TCP, Wi-Fi/LAN)--> MacKeyBridge.exe --> SendInput --> any Windows app
@@ -67,7 +67,7 @@ netsh advfirewall firewall add rule name="MacKeyBridge" dir=in action=allow prot
 
 ```bash
 cd Mac
-swiftc -O main.swift Clipboard.swift UI.swift -o MacKeyBridge && ./MacKeyBridge
+swiftc -O main.swift Clipboard.swift KeyboardMapping.swift Diagnostics.swift UI.swift -o MacKeyBridge && ./MacKeyBridge
 ```
 
 A window opens. In the **Connection** section enter the PC's **IP address** (its IPv4 address in your home network, `ipconfig` on the PC, e.g. `192.168.x.x` - not a VPN address), the **port** (47800) and the **secret** from the Windows settings, then click **Connect**. The settings are remembered.
@@ -97,7 +97,7 @@ Tap **Fn** to switch the Windows layout. Trackpad: move = pointer, tap or click 
 
 ## The Mac window
 
-The window is written in SwiftUI (macOS 12+), follows the system light / dark appearance and the accent colour, and stays in the menu bar when closed. From top to bottom:
+The window is written in SwiftUI (macOS 12+), supports the built-in themes and Liquid Glass toggle, and stays in the menu bar when closed. The main view has tabs: **Connect**, **Keyboard**, **Trackpad**, **Clipboard**, **Look**, **More** and **Diagnostics**. The sections below describe the classic settings layout; the same controls live in those tabs. From top to bottom:
 
 | Section | What it shows / does |
 |---|---|
@@ -110,6 +110,20 @@ The window is written in SwiftUI (macOS 12+), follows the system light / dark ap
 | **Activity Log** | Collapsible log with copy and clear buttons. |
 
 The menu bar item shows a keyboard symbol (dimmed when not connected, `→ PC` while forwarding) and has *Start/Stop Forwarding*, *Sync Clipboard*, *Open MacKeyBridge…* and *Quit*.
+
+## Network diagnostics
+
+The **Diagnostics** tab measures the live connection without opening a second socket or changing keyboard/mouse forwarding. All values come from the running connection; none are hardcoded.
+
+- **Connection Overview:** status (Connected / Reconnecting / Disconnected), current RTT, connection quality, uptime and heartbeat loss.
+- **Performance:** a native SwiftUI line graph of the last 60 seconds by default, average RTT, min/max RTT, jitter, frames sent and frames received. High-latency samples are orange.
+- **Network Details:** Windows hostname (sent by protocol 4 servers), IP/port, negotiated protocol version, connection duration, last successful heartbeat and reconnection count.
+- **Diagnostics Logs:** timestamped DEBUG / INFO / WARNING / ERROR events with **Clear Logs** and **Export Diagnostics** (UTF-8 text file). Logs never contain keyboard input, clipboard contents, the HMAC secret or other payloads.
+
+Sequence-numbered heartbeat metrics require protocol 4 on both sides. With a protocol 2 or 3 Windows app, the Mac keeps the original one-second keepalive and shows heartbeat metrics as unavailable; existing input forwarding and clipboard behavior are unchanged. A lightweight heartbeat is sent on the existing TCP connection. Its four-byte frame carries a flag (request or reply) and a 16-bit sequence number; the Mac measures RTT from a monotonic clock when the reply returns.
+ Jitter is the mean absolute difference between consecutive RTTs in the rolling window. Heartbeat loss is missed replies / (replies + misses) in that window; it is **not** a claim about TCP packet loss, which TCP handles itself. Connection quality (Excellent, Good, Fair, Poor, Unstable, Disconnected) uses latency, jitter and heartbeat loss with a three-second hysteresis window to avoid flicker.
+
+Settings: **Enable Network Diagnostics**, **Heartbeat Interval** (0.25–2 s, default 1 s), **High Latency Threshold** (20–1000 ms, default 150 ms), **Packet Loss Warning Threshold** (1–50%, default 10%), **Enable Diagnostic Logging** and **Graph History Duration** (30–300 s, default 60 s). All persist in `UserDefaults`. When diagnostics is disabled, the existing one-second keepalive continues so the server does not drop an idle connection.
 
 ## Clipboard sync
 
@@ -271,7 +285,7 @@ Missing permissions never leave the mouse captured: forwarding refuses to start,
 | **Include images** | Also sync images (default on); off = text only, in both directions |
 | Connect automatically when MacKeyBridge opens | Auto-connect with the saved settings |
 
-Settings are saved in the app's preferences (`UserDefaults`; with the bundle: `defaults read local.mackeybridge.client`). Keys: `host`, `port`, `secret`, `forwardMouse`, `pointerSpeed`, `scrollSpeed`, `invertV`, `invertH`, `autoConnect`, `swipeNav`, `swipeThreshold`, `swipeKeys` (0 arrows, 1 Page keys, 2 side buttons), `swipeReverse`, `hotkeyCode`, `hotkeyFlags`, `hotkeyName`, `clipboardSync`, `clipboardImages`.
+Settings are saved in the app's preferences (`UserDefaults`; with the bundle: `defaults read local.mackeybridge.client`). Keys: `host`, `port`, `secret`, `forwardMouse`, `pointerSpeed`, `scrollSpeed`, `invertV`, `invertH`, `autoConnect`, `swipeNav`, `swipeThreshold`, `swipeKeys` (0 arrows, 1 Page keys, 2 side buttons), `swipeReverse`, `hotkeyCode`, `hotkeyFlags`, `hotkeyName`, `clipboardSync`, `clipboardImages`, `themePreset`, `appearanceMode`, `liquidGlassEnabled`, `useCustomAccent`, `customAccent`, `selectedTab`, `diagnosticsEnabled`, `heartbeatInterval`, `highLatencyThreshold`, `packetLossWarning`, `diagnosticLogging`, `graphHistoryDuration`.
 
 ## Key mapping (Mac Mode, default)
 
@@ -328,7 +342,7 @@ Add language IDs (for example `0x0443` Uzbek Latin, `0x0407` German) to cycle th
 ./MacKeyBridge.app/Contents/MacOS/MacKeyBridge --selftest
 ```
 
-It checks the swipe recognizer (both directions, vertical scroll, small movements, one swipe per gesture, inertia, cooldown, thresholds), hotkey matching, the stuck-key bookkeeping and the clipboard frame parser (split reads, several messages per read, size limit, unknown types), and prints `PASS`/`FAIL` per case.
+It checks the swipe recognizer (both directions, vertical scroll, small movements, one swipe per gesture, inertia, cooldown, thresholds), hotkey matching, stuck-key bookkeeping, keyboard mapping, the clipboard frame parser (split reads, several messages per read, size limit, unknown types), heartbeat/host-info frames, settings validation, RTT aggregation, missed-heartbeat detection and rolling packet-loss calculation. It prints `PASS`/`FAIL` per case.
 
 **Manual checklist (needs the Mac, the PC and the permissions):**
 
@@ -405,15 +419,15 @@ Log file: `%APPDATA%\MacKeyBridge\log.txt` (enable *Debug mode* to log every key
 - The Mac client stores its settings, including the secret, in the app's preferences (`UserDefaults`) in plain text.
 - Clipboard sync covers text and images only (no files, no rich text formatting); one item at a time, up to 20 MB.
 
-## Protocol (version 3)
+## Protocol (version 4)
 
-After the TCP connection the server sends a 16-byte challenge; the client answers with `HMAC-SHA256(secret, nonce)` and the protocol version; the server replies `AUTH_OK` or `AUTH_FAIL` + reason (1 wrong secret, 2 version mismatch). The server accepts versions 2 and 3; the client offers 3 and retries with 2 when an older server answers *version mismatch*. Then the client sends events; the first byte is the type and fixes the length:
+After the TCP connection the server sends a 16-byte challenge; the client answers with `HMAC-SHA256(secret, nonce)` and the protocol version; the server replies `AUTH_OK` or `AUTH_FAIL` + reason (1 wrong secret, 2 version mismatch). The server accepts versions 2–4; the client offers 4 and steps down to 3, then 2, when an older server answers *version mismatch*. Version 3 adds clipboard sync; version 4 adds hostname information and sequence-numbered heartbeat replies. Then the client sends events; the first byte is the type and fixes the length:
 
 ```
 0x10 KEY_DOWN     [type][flags][code lo][code hi]       4 bytes (flags bit 0 = auto-repeat)
 0x11 KEY_UP       [type][flags][code lo][code hi]       4 bytes
 0x12 ALL_UP       [type][0][0][0]                       4 bytes - release keys and mouse buttons
-0x13 PING         [type][0][0][0]                       4 bytes
+0x13 PING         [type][flag][seq lo][seq hi]          4 bytes, flag 0 = request, 1 = reply
 0x20 MOUSE_MOVE   [type][dx int16][dy int16]            5 bytes, relative pixels
 0x21 MOUSE_BUTTON [type][button][down]                  3 bytes, 0 left 1 right 2 middle 3 back 4 forward
 0x22 MOUSE_WHEEL  [type][dx int16][dy int16]            5 bytes, 120 = one notch, dy>0 up, dx>0 right
@@ -421,8 +435,13 @@ After the TCP connection the server sends a 16-byte challenge; the client answer
 protocol 3 only, both directions:
 0x30 CLIPBOARD    [type][kind][len uint32][payload]       6 + len bytes, kind 1 = UTF-8 text (LF), 2 = PNG; len <= 20 MiB
 0x31 CLIP_STATE   [type][flags]                          2 bytes, bit 0 = sync on, bit 1 = images accepted
+
+protocol 4 only, server to client:
+0x40 HOST_INFO    [type][len u8][UTF-8 hostname]         2 + len bytes, len <= 255
 ```
 
-All integers are little-endian. Each side sends `CLIP_STATE` right after the handshake and whenever its setting changes, and sends `CLIPBOARD` only while the other side has announced *sync on*.
+All integers are little-endian. Each side sends `CLIP_STATE` right after the handshake and whenever its setting changes, and sends `CLIPBOARD` only while the other side has announced *sync on*. A v4 server sends `HOST_INFO` once after a successful handshake. Unknown heartbeat flags are ignored for compatibility; only exact request frames are answered, so two peers cannot start a reply loop.
 
-Key code: macOS virtual key code, or `0x100 + NX_KEYTYPE` for media keys (Fn = 63). Swipe navigation uses ordinary packets: `123` / `124` (Left / Right arrow) or `116` / `121` (Page Up / Page Down), each as KEY_DOWN followed by KEY_UP, or MOUSE_BUTTON `3` (Back) / `4` (Forward), each as down followed by up. The client pings every second; the server releases all keys and mouse buttons if nothing arrives for 3 seconds.
+The heartbeat uses the existing TCP connection and its existing writer queue: the client sends `PING` requests (default once per second), the server queues a `PING` reply with the same sequence without blocking input processing, and the client uses `systemUptime` to calculate RTT. This measures diagnostic reply delivery, not TCP retransmissions. The server releases all keys and mouse buttons if no bytes arrive for 3 seconds, so heartbeat intervals are limited to 2 seconds.
+
+Key code: macOS virtual key code, or `0x100 + NX_KEYTYPE` for media keys (Fn = 63). Swipe navigation uses ordinary packets: `123` / `124` (Left / Right arrow) or `116` / `121` (Page Up / Page Down), each as KEY_DOWN followed by KEY_UP, or MOUSE_BUTTON `3` (Back) / `4` (Forward), each as down followed by up.

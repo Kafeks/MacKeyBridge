@@ -9,15 +9,17 @@ setvbuf(stdout, nil, _IOLBF, 0)
 // MARK: - Logging (stdout + log box in the window)
 
 var gLogSink: ((String) -> Void)?
+let gNetDiag = NetworkDiagnostics()
 
 func say(_ s: String) {
     print("[mackeybridge] \(s)")
     DispatchQueue.main.async { gLogSink?(s) }
 }
 
-// MARK: - Protocol constants (version 3; version 2 = without clipboard, still spoken with an older Windows app)
+// MARK: - Protocol constants (version 4; versions 3 and 2 are still spoken with older Windows apps)
 
-let protoVersion: UInt8 = 3
+let protoVersionV4: UInt8 = 4
+let protoVersion: UInt8 = protoVersionV4
 let protoVersionLegacy: UInt8 = 2
 let pktChallenge: UInt8 = 0x01
 let pktAuth: UInt8 = 0x02
@@ -27,6 +29,8 @@ let pktKeyDown: UInt8 = 0x10
 let pktKeyUp: UInt8 = 0x11
 let pktAllUp: UInt8 = 0x12
 let pktPing: UInt8 = 0x13
+let pingFlagRequest: UInt8 = 0
+let pingFlagReply: UInt8 = 1
 let pktMouseMove: UInt8 = 0x20
 let pktMouseButton: UInt8 = 0x21
 let pktMouseWheel: UInt8 = 0x22
@@ -40,11 +44,17 @@ let clipKindPNG: UInt8 = 2
 let clipFlagOn: UInt8 = 0x01
 let clipFlagImages: UInt8 = 0x02
 let clipMaxBytes = 20 * 1024 * 1024
+// Protocol 4, server to client:
+//   0x40 HOST_INFO  [type][len u8][UTF-8 hostname]     len <= 255
+let pktHostInfo: UInt8 = 0x40
+let hostInfoMaxBytes = 255
 
 /// What the Windows side can send us after the handshake.
 enum PeerMessage: Equatable {
     case clipboard(kind: UInt8, data: Data)
     case clipboardState(enabled: Bool, images: Bool)
+    case ping(flag: UInt8, sequence: UInt16)
+    case hostInfo(String)
 }
 
 func clipboardPacket(kind: UInt8, payload: Data) -> [UInt8] {
@@ -59,6 +69,7 @@ struct PeerFrameParser {
     enum Failure: Error, Equatable {
         case unknownType(UInt8)
         case tooLarge(Int)
+        case invalidHostInfo
     }
 
     let maxPayload: Int
@@ -90,7 +101,20 @@ struct PeerFrameParser {
                 pos += 6 + len
             } else if type == pktPing {
                 guard avail >= 4 else { break }
+                let flag = buf[pos + 1]
+                let seq = UInt16(buf[pos + 2]) | UInt16(buf[pos + 3]) << 8
+                out.append(.ping(flag: flag, sequence: seq))
                 pos += 4
+            } else if type == pktHostInfo {
+                guard avail >= 2 else { break }
+                let len = Int(buf[pos + 1])
+                guard len <= hostInfoMaxBytes else { throw Failure.tooLarge(len) }
+                guard avail >= 2 + len else { break }
+                guard let name = String(bytes: buf[(pos + 2)..<(pos + 2 + len)], encoding: .utf8) else {
+                    throw Failure.invalidHostInfo
+                }
+                out.append(.hostInfo(name))
+                pos += 2 + len
             } else {
                 throw Failure.unknownType(type)
             }
@@ -207,6 +231,30 @@ final class Prefs {
     var selectedTab: Int {
         get { d.object(forKey: "selectedTab") as? Int ?? 0 }
         set { d.set(newValue, forKey: "selectedTab") }
+    }
+    var diagnosticsEnabled: Bool {
+        get { (d.object(forKey: "diagnosticsEnabled") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "diagnosticsEnabled") }
+    }
+    var heartbeatInterval: Double {
+        get { DiagnosticsConfig.clampInterval(d.double(forKey: "heartbeatInterval")) }
+        set { d.set(DiagnosticsConfig.clampInterval(newValue), forKey: "heartbeatInterval") }
+    }
+    var highLatencyThreshold: Double {
+        get { DiagnosticsConfig.clampLatency(d.double(forKey: "highLatencyThreshold")) }
+        set { d.set(DiagnosticsConfig.clampLatency(newValue), forKey: "highLatencyThreshold") }
+    }
+    var packetLossWarning: Double {
+        get { DiagnosticsConfig.clampLoss(d.double(forKey: "packetLossWarning")) }
+        set { d.set(DiagnosticsConfig.clampLoss(newValue), forKey: "packetLossWarning") }
+    }
+    var diagnosticLogging: Bool {
+        get { (d.object(forKey: "diagnosticLogging") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "diagnosticLogging") }
+    }
+    var graphHistoryDuration: Double {
+        get { DiagnosticsConfig.clampDuration(d.double(forKey: "graphHistoryDuration")) }
+        set { d.set(DiagnosticsConfig.clampDuration(newValue), forKey: "graphHistoryDuration") }
     }
     /// Emergency hotkey. Falls back to Control+Option+Command+W if the stored value is missing or unsafe.
     var hotkey: Hotkey {
@@ -343,6 +391,7 @@ final class Link {
         self.secret = secret
         version = protoVersion  // a new attempt offers the newest protocol again
         wanted = true
+        gNetDiag.setWanted(true)
         generation += 1
         let s = fd
         lock.unlock()
@@ -352,6 +401,7 @@ final class Link {
     func disconnect() {
         lock.lock()
         wanted = false
+        gNetDiag.noteUserDisconnect()
         generation += 1
         let s = fd
         lock.unlock()
@@ -366,7 +416,11 @@ final class Link {
             let up = (state == .connected)
             lock.unlock()
             guard up, s >= 0 else { return }
-            if !writeAll(s, bytes) { shutdown(s, SHUT_RDWR) }  // wakes the loop, which reconnects
+            if writeAll(s, bytes) {
+                gNetDiag.notePacketSent(bytes: bytes.count)
+            } else {
+                shutdown(s, SHUT_RDWR)  // wakes the loop, which reconnects
+            }
         }
     }
 
@@ -414,8 +468,10 @@ final class Link {
             }
 
             setState(.connecting)
+            gNetDiag.noteAttempt(host: h)
             let opened = openSocket(host: h, port: p)
             if opened.fd < 0 {
+                gNetDiag.noteConnectionFailure(opened.reason)
                 if opened.reason != lastFailure {
                     say(opened.reason)
                     lastFailure = opened.reason
@@ -430,13 +486,16 @@ final class Link {
             if hs != .ok {
                 close(s)
                 if hs == .versionMismatch && ver > protoVersionLegacy {
-                    // An older MacKeyBridge.exe: speak protocol 2 with it (keyboard + trackpad, no clipboard).
+                    let next = ver - 1
                     lock.lock()
-                    if generation == gen { version = protoVersionLegacy }
+                    if generation == gen { version = next }
                     lock.unlock()
-                    say("The Windows app is an older version: keyboard and trackpad work, clipboard sync needs the new MacKeyBridge.exe")
+                    let msg = "The Windows app does not support protocol \(ver); retrying with \(next)"
+                    say(msg)
+                    gNetDiag.noteConnectionFailure(msg)
                     continue
                 }
+                gNetDiag.noteConnectionFailure(hs.message)
                 if hs.message != lastFailure {
                     say(hs.message)
                     lastFailure = hs.message
@@ -457,11 +516,12 @@ final class Link {
             lock.unlock()
             lastFailure = ""
             setState(.connected)
+            gNetDiag.noteConnected(host: "\(h):\(p)", version: ver)
             say("Connected to Windows at \(h):\(p)" + (ver >= 3 ? "" : " (protocol \(ver), no clipboard sync)"))
 
             var parser = PeerFrameParser()
             var buf = [UInt8](repeating: 0, count: 65536)
-            var lastPing = 0.0
+            var lastPlainPing = 0.0
             var pfd = pollfd(fd: s, events: Int16(POLLIN), revents: 0)
             while true {
                 lock.lock()
@@ -469,23 +529,48 @@ final class Link {
                 lock.unlock()
                 if g != gen { break }
 
+                let now = ProcessInfo.processInfo.systemUptime
+                if gNetDiag.currentConfig().enabled && ver >= protoVersionV4 {
+                    if let seq = gNetDiag.takeHeartbeatTick(now: now) {
+                        enqueue([pktPing, pingFlagRequest, UInt8(seq & 0xFF), UInt8(seq >> 8)])
+                    }
+                } else if now - lastPlainPing >= 1.0 {
+                    lastPlainPing = now
+                    enqueue([pktPing, pingFlagRequest, 0, 0])
+                }
+
                 let r = poll(&pfd, 1, 250)
                 if r < 0 {
                     if errno == EINTR { continue }
+                    gNetDiag.noteConnectionFailure("Socket poll failed")
                     break
-                }
-                // Keep-alive once per second, also while data is coming in (the server drops us after 3 s of silence).
-                let now = ProcessInfo.processInfo.systemUptime
-                if now - lastPing >= 1.0 {
-                    lastPing = now
-                    enqueue([pktPing, 0, 0, 0])
                 }
                 if r == 0 { continue }
                 let n = recv(s, &buf, buf.count, 0)
                 if n <= 0 { break }  // closed or error
                 do {
-                    for m in try parser.feed(Array(buf[0..<n])) { onMessage?(m) }
+                    for m in try parser.feed(Array(buf[0..<n])) {
+                        gNetDiag.noteFrameReceived(bytes: 0)
+                        let receivedAt = ProcessInfo.processInfo.systemUptime
+                        switch m {
+                        case .ping(let flag, let seq):
+                            if flag == pingFlagReply {
+                                if let sentAt = gNetDiag.pendingHeartbeatSentAt(seq: seq) {
+                                    gNetDiag.completeHeartbeat(seq: seq,
+                                                               rttMs: max(0, (receivedAt - sentAt) * 1000.0),
+                                                               now: receivedAt)
+                                }
+                            } else if flag == pingFlagRequest {
+                                enqueue([pktPing, pingFlagReply, UInt8(seq & 0xFF), UInt8(seq >> 8)])
+                            }
+                        case .hostInfo(let name):
+                            gNetDiag.noteHostname(name)
+                        case .clipboard, .clipboardState:
+                            onMessage?(m)
+                        }
+                    }
                 } catch {
+                    gNetDiag.noteProtocolError("\(error)")
                     say("Unexpected data from Windows (\(error)) - reconnecting")
                     break
                 }
@@ -502,6 +587,7 @@ final class Link {
             lock.unlock()
             if stillWanted {
                 say("Connection to Windows lost - retrying")
+                gNetDiag.noteDisconnected("Connection lost")
                 setState(.failed("Connection lost - retrying"))
                 waitRetry(gen, 1.0)
             }
@@ -1719,9 +1805,11 @@ func runSelfTests() -> Int32 {
     }
     check("clipboard text split over many reads", pieces == [.clipboard(kind: clipKindText, data: text)])
     fp = PeerFrameParser()
-    let two = (try? fp.feed([pktClipState, clipFlagOn | clipFlagImages, pktPing, 0, 0, 0, pktClipState, 0])) ?? []
+    let two = (try? fp.feed([pktClipState, clipFlagOn | clipFlagImages, pktPing, pingFlagRequest, 0x34, 0x12,
+                             pktClipState, 0])) ?? []
     check("state + ping + state in one read",
-          two == [.clipboardState(enabled: true, images: true), .clipboardState(enabled: false, images: false)])
+          two == [.clipboardState(enabled: true, images: true), .ping(flag: pingFlagRequest, sequence: 0x1234),
+                  .clipboardState(enabled: false, images: false)])
     fp = PeerFrameParser(maxPayload: 10)
     var tooBig = false
     do { _ = try fp.feed(clipboardPacket(kind: clipKindPNG, payload: Data(count: 11))) } catch { tooBig = true }
@@ -1733,6 +1821,75 @@ func runSelfTests() -> Int32 {
     fp = PeerFrameParser()
     let empty = (try? fp.feed(clipboardPacket(kind: clipKindText, payload: Data()))) ?? []
     check("empty clipboard payload is accepted", empty == [.clipboard(kind: clipKindText, data: Data())])
+
+    // 15: diagnostic frames and metric collection.
+    fp = PeerFrameParser()
+    let pings = (try? fp.feed([pktPing, pingFlagRequest, 0x34, 0x12, pktPing, pingFlagReply, 0x78, 0x56])) ?? []
+    check("heartbeat frames carry flags and sequence",
+          pings == [.ping(flag: pingFlagRequest, sequence: 0x1234), .ping(flag: pingFlagReply, sequence: 0x5678)])
+    let nameBytes = Array("DESKTOP-TEST".utf8)
+    let hostFrame = [pktHostInfo, UInt8(nameBytes.count)] + nameBytes
+    fp = PeerFrameParser()
+    let hostWhole = (try? fp.feed(hostFrame)) ?? []
+    check("host info frame round-trips", hostWhole == [.hostInfo("DESKTOP-TEST")])
+    fp = PeerFrameParser()
+    var hostPieces: [PeerMessage] = []
+    for i in stride(from: 0, to: hostFrame.count, by: 2) {
+        hostPieces += (try? fp.feed(Array(hostFrame[i..<min(i + 2, hostFrame.count)]))) ?? []
+    }
+    check("host info frame survives split reads", hostPieces == [.hostInfo("DESKTOP-TEST")])
+
+    var cfg = DiagnosticsConfig()
+    cfg.heartbeatInterval = 99
+    cfg.highLatencyMs = -5
+    cfg.lossWarningPct = 500
+    cfg.graphDuration = 0
+    cfg.validate()
+    check("diagnostic settings are clamped",
+          cfg.heartbeatInterval == 2 && cfg.highLatencyMs == 20 && cfg.lossWarningPct == 50 && cfg.graphDuration == 30)
+
+    let nd = NetworkDiagnostics()
+    let base = ProcessInfo.processInfo.systemUptime
+    nd.noteConnected(host: "192.168.1.20:47800", version: 4)
+    let seq = nd.takeHeartbeatTick(now: base)
+    check("heartbeat is scheduled while connected", seq != nil)
+    if let s = seq { nd.completeHeartbeat(seq: s, rttMs: 12, now: base + 0.012) }
+    var nds = nd.snapshot()
+    check("RTT statistics come from measurements",
+          nds.latencyMs == 12 && nds.averageMs == 12 && nds.minimumMs == 12 && nds.maximumMs == 12 &&
+          nds.heartbeatReplies == 1 && nds.lossPct == 0)
+    let missedSeq = nd.takeHeartbeatTick(now: base + 1.0)
+    check("missed heartbeat is detected by monotonic timeout", missedSeq != nil)
+    if missedSeq != nil { _ = nd.takeHeartbeatTick(now: base + 5.0) }
+    nds = nd.snapshot()
+    check("heartbeat loss is calculated from the rolling window",
+          nds.heartbeatMisses == 1 && nds.lossPct > 0 && nds.samples.contains { $0.missed })
+    nd.noteDisconnected("test")
+    nds = nd.snapshot()
+    check("disconnect clears connection uptime", !nds.connected && nds.uptime == 0)
+
+    let delayed = NetworkDiagnostics()
+    var delayedConfig = DiagnosticsConfig()
+    delayedConfig.highLatencyMs = 100
+    delayed.updateConfig(delayedConfig)
+    delayed.noteConnected(host: "192.168.1.20:47800", version: 4)
+    let fastSeq = delayed.takeHeartbeatTick(now: base)
+    if let s = fastSeq { delayed.completeHeartbeat(seq: s, rttMs: 12, now: base + 0.012) }
+    let slowSeq = delayed.takeHeartbeatTick(now: base + 1.0)
+    if let s = slowSeq { delayed.completeHeartbeat(seq: s, rttMs: 120, now: base + 1.12) }
+    nds = delayed.snapshot()
+    check("delayed heartbeat raises max latency and jitter",
+          nds.maximumMs == 120 && (nds.jitterMs ?? 0) > 0 && nds.samples.filter { $0.high }.count == 1)
+
+    var offConfig = DiagnosticsConfig()
+    offConfig.enabled = false
+    delayed.updateConfig(offConfig)
+    check("disabled diagnostics stops heartbeat scheduling", delayed.takeHeartbeatTick(now: base + 3.0) == nil)
+
+    let reconnect = NetworkDiagnostics()
+    reconnect.noteAttempt(host: "192.168.1.20:47800")
+    reconnect.noteAttempt(host: "192.168.1.20:47800")
+    check("reconnection attempts are counted", reconnect.snapshot().reconnectionCount == 1)
 
     print(failed == 0 ? "\nAll self-tests passed." : "\n\(failed) self-test(s) FAILED.")
     return failed == 0 ? 0 : 1
@@ -1850,6 +2007,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                      NSWorkspace.sessionDidResignActiveNotification] {
             wsCenter.addObserver(forName: name, object: nil, queue: nil) { note in
                 gFwd.stop(reason: note.name.rawValue)
+                gNetDiag.noteSleep()
+            }
+            wsCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { _ in
+                gNetDiag.noteWake()
             }
         }
 

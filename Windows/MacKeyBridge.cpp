@@ -103,21 +103,21 @@ void write(Level lvl, const char* fmt, ...)
 #define LOG_WARN(...)  Log::write(Log::Level::Warn, __VA_ARGS__)
 #define LOG_ERROR(...) Log::write(Log::Level::Error, __VA_ARGS__)
 
-// Wire protocol between the macOS client and the Windows server (version 3; version 2 clients are still
-// accepted, they just get no clipboard sync). Mirrored by constants at the top of the macOS client (main.swift).
+// Wire protocol between the macOS client and the Windows server (version 4; versions 3 and 2 clients are still
+// accepted). Mirrored by constants at the top of the macOS client (main.swift).
 //
 // Handshake (once per TCP connection):
 //   server -> client : [0x01 CHALLENGE][16 random bytes]
 //   client -> server : [0x02 AUTH][version][32 bytes HMAC-SHA256(secret, nonce)]
 //   server -> client : [0x03 AUTH_OK]   or   [0x04 AUTH_FAIL][reason]  (then close)
 //                      reason: 1 = wrong secret, 2 = protocol version mismatch
-//   The client offers version 3 and falls back to 2 when an older server answers "version mismatch".
+//   The client offers version 4 and steps down (4 -> 3 -> 2) when an older server answers "version mismatch".
 //
 // Events (client -> server). The first byte is the type and determines the length:
 //   0x10 KEY_DOWN     [type][flags][code lo][code hi]            4 bytes (flags bit0 = auto-repeat)
 //   0x11 KEY_UP       [type][flags][code lo][code hi]            4 bytes
 //   0x12 ALL_UP       [type][0][0][0]                            4 bytes: release keys AND mouse buttons
-//   0x13 PING         [type][0][0][0]                            4 bytes
+//   0x13 PING         [type][flag][seq lo][seq hi]               4 bytes, flag 0 = request, 1 = reply
 //   0x20 MOUSE_MOVE   [type][dx lo][dx hi][dy lo][dy hi]         5 bytes, int16 LE, relative, pixels
 //   0x21 MOUSE_BUTTON [type][button][down 0/1]                   3 bytes, button: 0 left, 1 right, 2 middle,
 //                                                                          3 back (X1), 4 forward (X2)
@@ -131,9 +131,13 @@ void write(Level lvl, const char* fmt, ...)
 //   0x31 CLIP_STATE   [type][flags]                              2 bytes, bit0 = sync on, bit1 = images accepted
 // Each side sends CLIP_STATE right after connecting and whenever its setting changes, and sends clipboard
 // contents only while the other side has announced "sync on".
+//
+// Diagnostics (server -> client from version 4, heartbeat replies on every version):
+//   PING request is answered on the existing connection with PING reply and the same sequence. The server also
+//   sends 0x40 HOST_INFO [type][len u8][UTF-8 hostname] once after a version-4 handshake.
 
 namespace proto {
-constexpr uint8_t  kVersion     = 3;  // newest protocol we speak
+constexpr uint8_t  kVersion     = 4;  // newest protocol we speak
 constexpr uint8_t  kMinVersion  = 2;  // oldest client we still accept (keyboard + trackpad, no clipboard)
 constexpr uint16_t kDefaultPort = 47800;
 constexpr size_t   kNonceLen    = 16;
@@ -147,7 +151,9 @@ constexpr uint8_t kAuthFail  = 0x04;
 constexpr uint8_t kKeyDown = 0x10;
 constexpr uint8_t kKeyUp   = 0x11;
 constexpr uint8_t kAllUp   = 0x12;
-constexpr uint8_t kPing    = 0x13;
+constexpr uint8_t kPing         = 0x13;
+constexpr uint8_t kPingRequest  = 0;
+constexpr uint8_t kPingReply    = 1;
 
 constexpr uint8_t kMouseMove   = 0x20;
 constexpr uint8_t kMouseButton = 0x21;
@@ -155,6 +161,8 @@ constexpr uint8_t kMouseWheel  = 0x22;
 
 constexpr uint8_t  kClipboard     = 0x30;
 constexpr uint8_t  kClipState     = 0x31;
+constexpr uint8_t  kHostInfo      = 0x40;
+constexpr size_t   kHostInfoMax   = 255;
 constexpr uint8_t  kClipText      = 1;
 constexpr uint8_t  kClipPng       = 2;
 constexpr uint8_t  kClipFlagOn    = 0x01;
@@ -1768,6 +1776,26 @@ void NetworkServer::serve(SOCKET s, const std::string& peer, uint8_t version) {
             const uint8_t f = localClip_ ? (uint8_t)(proto::kClipFlagOn | proto::kClipFlagImages) : (uint8_t)0;
             queueLocked({proto::kClipState, f});
         }
+        if (version >= 4) {
+            wchar_t computerName[256] = {};
+            DWORD nameLen = 255;
+            if (GetComputerNameW(computerName, &nameLen) && nameLen > 0) {
+                int utf8Len = WideCharToMultiByte(CP_UTF8, 0, computerName, (int)nameLen, nullptr, 0, nullptr, nullptr);
+                if (utf8Len > 1 && utf8Len - 1 <= (int)proto::kHostInfoMax) {
+                    std::string utf8((size_t)utf8Len, '\0');
+                    int written = WideCharToMultiByte(CP_UTF8, 0, computerName, (int)nameLen, &utf8[0], utf8Len, nullptr, nullptr);
+                    if (written > 1) {
+                        utf8.resize((size_t)written - 1);
+                        std::vector<uint8_t> msg;
+                        msg.reserve(2 + utf8.size());
+                        msg.push_back(proto::kHostInfo);
+                        msg.push_back((uint8_t)utf8.size());
+                        msg.insert(msg.end(), utf8.begin(), utf8.end());
+                        queueLocked(std::move(msg));
+                    }
+                }
+            }
+        }
     }
     std::thread writer(&NetworkServer::writerLoop, this, s);
     LOG_INFO("Connected to MacBook (%s, protocol %u%s)", peer.c_str(), (unsigned)version,
@@ -1811,6 +1839,12 @@ void NetworkServer::serve(SOCKET s, const std::string& peer, uint8_t version) {
                 kb_.onAllUp();
                 break;
             case proto::kPing:
+                if (ev[1] == proto::kPingRequest) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (!outClosed_ && outbox_.size() < 64) {
+                        queueLocked({proto::kPing, proto::kPingReply, ev[2], ev[3]});
+                    }
+                }
                 break;
             case proto::kMouseMove:
                 kb_.onMouseMove((int16_t)(ev[1] | (ev[2] << 8)), (int16_t)(ev[3] | (ev[4] << 8)));
